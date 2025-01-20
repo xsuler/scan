@@ -1,457 +1,331 @@
 import streamlit as st
-import aiohttp
-import numpy as np
-import asyncio
 import pandas as pd
-import threading
-import json
-import os
 import requests
-import time
 from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+import time
 
-# Default values will be overridden by UI inputs
-STATE_FILE = "scanner_state.json"
-RESULTS_FILE = "results.csv"
-LOG_FILE = "scanner_logs.json"
-
-# ======================
-# HTTP Client Utilities
-# ======================
-async def fetch_with_retry(session, url, headers, params, max_retries):
-    for attempt in range(max_retries):
-        try:
-            async with session.get(url, headers=headers, params=params) as response:
-                response.raise_for_status()
-                return await response.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            if attempt < max_retries - 1:
-                wait_time = 2 ** attempt
-                await asyncio.sleep(wait_time)
-            else:
-                raise e
-    return None
+# Configuration
+COINCAP_API = "https://api.coincap.io/v2"
+RESULTS_FILE = "crypto_scan_results.csv"
 
 # ======================
-# Data Fetching Functions
+# Data Fetching & Processing
 # ======================
-def fetch_top_tokens(api_key, min_liquidity):
-    """Fetch tokens with highest 24h volume using BirdEye's tokenlist endpoint"""
-    url = "https://public-api.birdeye.so/defi/tokenlist"
-    params = {"sort_by": "v24hUSD", "sort_type": "desc", "offset": 0, "min_liquidity": min_liquidity}
-    headers = {"accept": "application/json", "x-chain": "solana", "X-API-KEY": api_key}
-    
+def fetch_assets():
+    """Fetch top assets from CoinCap API with error handling"""
     try:
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(f"{COINCAP_API}/assets", params={
+            'limit': 100,
+            'sort': 'volumeUsd24Hr',
+            'order': 'desc'
+        })
         response.raise_for_status()
-        data = response.json()
-        return data.get('data', {}).get('tokens', [])
+        return response.json().get('data', [])
     except Exception as e:
+        st.error(f"API Error: {str(e)}")
         return []
 
-async def get_dex_data(session, token_address, api_key, max_retries):
-    """Get current price data from BirdEye's API"""
-    url = "https://public-api.birdeye.so/defi/price"
-    params = {'address': token_address}
-    headers = {"accept": "application/json", "X-API-KEY": api_key, "x-chain": "solana"}
-    
-    try:
-        data = await fetch_with_retry(session, url, headers, params, max_retries)
-        return data['data'] if data.get('success') else None
-    except Exception as e:
-        return None
-
-async def get_historical_data(session, token_address, hours, interval, api_key, max_retries):
-    """Get historical price data"""
-    url = "https://public-api.birdeye.so/defi/history_price"
-    now = datetime.now()
-    params = {
-        'address': token_address,
-        'address_type': 'token',
-        'type': interval,
-        'time_from': int((now - timedelta(hours=hours)).timestamp()),
-        'time_to': int(now.timestamp())
-    }
-    headers = {"accept": "application/json", "X-API-KEY": api_key, "x-chain": "solana"}
-    
-    try:
-        data = await fetch_with_retry(session, url, headers, params, max_retries)
-        return data.get('data', {}).get('items', []) if data.get('success') else None
-    except Exception as e:
-        return None
-
-# ======================
-# Analysis Functions
-# ======================
-def calculate_metrics(historical_data):
-    """Calculate volatility and momentum from historical prices"""
-    if not historical_data or len(historical_data) < 4:
-        return None
-    
-    prices = [x['value'] for x in historical_data]
-    changes = np.diff(prices) / prices[:-1] * 100
-    
+def process_asset(asset):
+    """Convert API response to cleaned data with proper types"""
     return {
-        'volatility': np.std(changes),
-        '3period_change': sum(changes[-3:]),
-        '6h_ma': np.mean(prices[-3:])
-    }
-
-async def analyze_token(session, token, scanner):
-    """Full analysis for a single token"""
-    if token['symbol'] in scanner.parameters['stablecoins']:
-        scanner.add_log(f"Skipping stablecoin {token['symbol']}")
-        return None
-    
-    dex_data = await get_dex_data(session, token['address'], 
-                                scanner.parameters['api_key'],
-                                scanner.parameters['max_retries'])
-    if dex_data is None:
-        scanner.add_log(f"Failed to fetch DEX data for {token['symbol']}")
-        return None
-    
-    await asyncio.sleep(scanner.parameters['delay_between_tokens'])
-    historical_data = await get_historical_data(session, token['address'],
-                                              scanner.parameters['historical_hours'],
-                                              scanner.parameters['historical_interval'],
-                                              scanner.parameters['api_key'],
-                                              scanner.parameters['max_retries'])
-    if not historical_data:
-        scanner.add_log(f"Failed to fetch historical data for {token['symbol']}")
-        return None
-    
-    metrics = calculate_metrics(historical_data)
-    if not metrics:
-        scanner.add_log(f"Insufficient data for metrics calculation: {token['symbol']}")
-        return None
-    
-    meets_criteria = all([
-        token['liquidity'] >= scanner.parameters['min_liquidity'],
-        token['v24hUSD'] >= scanner.parameters['min_volume'],
-        dex_data['priceChange24h'] >= scanner.parameters['min_price_change_24h'],
-        dex_data['value'] > scanner.parameters['min_price'],
-        metrics['volatility'] < scanner.parameters['max_volatility'],
-        metrics['volatility'] > scanner.parameters['min_volatility'],
-        metrics['3period_change'] > scanner.parameters['min_3period_change'],
-    ])
-    
-    if not meets_criteria:
-        scanner.add_log(f"Token {token['symbol']} does not meet criteria")
-        return None
-    
-    scanner.add_log(f"New opportunity detected: {token['symbol']}")
-    return {
-        'symbol': token['symbol'],
-        'address': token['address'],
-        'price': dex_data['value'],
-        '24h_chg': f"{dex_data['priceChange24h']:.1f}%",
-        'volatility': f"{metrics['volatility']:.1f}%",
-        '6h_momentum': f"{metrics['3period_change']:.1f}%",
-        'volume': f"${token['v24hUSD']/1000:.1f}K",
-        'liquidity': f"${token['liquidity']/1000:.1f}K",
-        'market_cap': f"${token.get('mc',0)/1e6:.2f}M",
-        'timestamp': datetime.now().isoformat()
+        'id': asset['id'],
+        'symbol': asset['symbol'].upper(),
+        'name': asset['name'],
+        'price': float(asset['priceUsd']),
+        'market_cap': float(asset['marketCapUsd']),
+        'volume_24h': float(asset['volumeUsd24Hr']),
+        'change_24h': float(asset['changePercent24Hr']),
+        'supply': float(asset['supply']),
+        'max_supply': float(asset['maxSupply']) if asset['maxSupply'] else None,
+        'rank': int(asset['rank']),
+        'vwap_24h': float(asset['vwap24Hr']),
+        'timestamp': datetime.now().isoformat(),
+        'explorer': asset.get('explorer', '')
     }
 
 # ======================
-# State Management
+# Professional Analysis Engine
 # ======================
-def load_state():
-    try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"running": False, "last_run": None, "processed": 0}
+class AssetAnalyzer:
+    def __init__(self, params):
+        self.params = params
+        
+    def analyze(self, asset):
+        """Comprehensive asset analysis with multiple metrics"""
+        analysis = {
+            'symbol': asset['symbol'],
+            'price': asset['price'],
+            'market_cap': asset['market_cap'],
+            'volume_24h': asset['volume_24h'],
+            'change_24h': asset['change_24h'],
+            'vwap_deviation_pct': self.calculate_vwap_deviation(asset),
+            'supply_utilization': self.calculate_supply_utilization(asset),
+            'volume_mcap_ratio': self.calculate_volume_mcap_ratio(asset),
+            'liquidity_score': self.calculate_liquidity_score(asset),
+            'timestamp': asset.get('timestamp', datetime.now().isoformat())
+        }
+        
+        if self.passes_filters(analysis):
+            return analysis
+        return None
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+    def calculate_vwap_deviation(self, asset):
+        try:
+            return ((asset['price'] - asset['vwap_24h']) / asset['vwap_24h']) * 100
+        except ZeroDivisionError:
+            return 0.0
 
+    def calculate_supply_utilization(self, asset):
+        if asset['max_supply'] and asset['max_supply'] > 0:
+            return (asset['supply'] / asset['max_supply']) * 100
+        return 100.0
+
+    def calculate_volume_mcap_ratio(self, asset):
+        if asset['market_cap'] > 0:
+            return (asset['volume_24h'] / asset['market_cap']) * 100
+        return 0.0
+
+    def calculate_liquidity_score(self, asset):
+        return (asset['volume_24h'] * 0.4 + 
+                asset['market_cap'] * 0.3 + 
+                (100 + asset['change_24h']) * 0.3)
+
+    def passes_filters(self, analysis):
+        checks = [
+            analysis['market_cap'] >= self.params['min_mcap'],
+            analysis['volume_24h'] >= self.params['min_volume'],
+            analysis['price'] >= self.params['min_price'],
+            analysis['change_24h'] >= self.params['min_change_24h'],
+            analysis['volume_mcap_ratio'] >= self.params['min_volume_ratio'],
+            analysis['vwap_deviation_pct'] >= self.params['min_vwap_deviation'],
+            analysis['liquidity_score'] >= self.params['min_liquidity_score']
+        ]
+        return all(checks)
+
+# ======================
+# Enhanced State Management
+# ======================
 def load_results():
-    try:
-        updated = pd.read_csv(RESULTS_FILE)
-        updated = updated.sort_values(by='timestamp').drop_duplicates(subset='address', keep='last')
-        return updated
-    except FileNotFoundError:
-        return pd.DataFrame()
-
-def save_results(df):
-    df.to_csv(RESULTS_FILE, index=False)
-
-def load_processed_addresses():
+    """Load results with column validation"""
+    required_cols = [
+        'timestamp', 'symbol', 'price', 'market_cap',
+        'volume_24h', 'change_24h', 'vwap_deviation_pct',
+        'supply_utilization', 'volume_mcap_ratio', 'liquidity_score'
+    ]
+    
     try:
         df = pd.read_csv(RESULTS_FILE)
-        return set(df['address'])
-    except FileNotFoundError:
-        return set()
+        # Add missing columns with default values
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = pd.NaT if col == 'timestamp' else 0.0
+        return df
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        return pd.DataFrame(columns=required_cols)
+
+def save_results(df):
+    """Save results with column validation"""
+    required_cols = [
+        'timestamp', 'symbol', 'price', 'market_cap',
+        'volume_24h', 'change_24h', 'vwap_deviation_pct',
+        'supply_utilization', 'volume_mcap_ratio', 'liquidity_score'
+    ]
+    
+    # Create new DataFrame with required columns
+    safe_df = pd.DataFrame(columns=required_cols)
+    
+    # Copy existing data
+    for col in required_cols:
+        if col in df.columns:
+            safe_df[col] = df[col]
+        else:
+            safe_df[col] = pd.NaT if col == 'timestamp' else 0.0
+    
+    safe_df.to_csv(RESULTS_FILE, index=False)
 
 # ======================
-# Scanner Service
+# Streamlit UI with Fixes
 # ======================
-class ScannerService:
-    def __init__(self):
-        self.running = False
-        self.thread = None
-        self.lock = threading.Lock()
-        self.logs = []
-        self.log_lock = threading.Lock()
-        self._load_logs()
-        self.parameters = {
-            'api_key': "c9053344ac544522896e3e0814047d48",
-            'min_liquidity_top': 1000,
-            'min_liquidity': 5000,
-            'min_volume': 25000,
-            'min_price_change_24h': 3.0,
-            'min_price': 0.00001,
-            'max_volatility': 30.0,
-            'min_volatility': 5.0,
-            'min_3period_change': 1.5,
-            'historical_hours': 24,
-            'historical_interval': '2H',
-            'stablecoins': ['USDC', 'USDT', 'USDH'],
-            'max_retries': 10,
-            'delay_between_tokens': 3,
-            'delay_between_cycles':3 
+def main():
+    st.set_page_config(page_title="Professional Crypto Scanner", layout="wide")
+    st.title("📊 Institutional-Grade Crypto Asset Scanner")
+
+    # Initialize session state
+    if 'params' not in st.session_state:
+        st.session_state.params = {
+            'min_mcap': 1e9,
+            'min_volume': 5e7,
+            'min_price': 1.0,
+            'min_change_24h': 2.0,
+            'min_volume_ratio': 0.5,
+            'min_vwap_deviation': -2.0,
+            'min_liquidity_score': 50.0,
+            'excluded_assets': ['USDT', 'USDC', 'BUSD']
         }
-
-    def _load_logs(self):
-        try:
-            with open(LOG_FILE, "r") as f:
-                self.logs = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            self.logs = []
-
-    def _save_logs(self):
-        with open(LOG_FILE, "w") as f:
-            json.dump(self.logs[-100:], f)
-
-    def add_log(self, message):
-        with self.log_lock:
-            timestamp = datetime.now().isoformat()
-            self.logs.append({"timestamp": timestamp, "message": message})
-            self._save_logs()
-
-    def get_logs(self):
-        with self.log_lock:
-            return self.logs.copy()
-
-    def start(self):
-        with self.lock:
-            if not self.running:
-                self.running = True
-                self.thread = threading.Thread(target=self.run, daemon=True)
-                self.thread.start()
-                save_state({"running": True, "last_run": str(datetime.now()), "processed": 0})
-                self.add_log("Service started")
-
-    def stop(self):
-        with self.lock:
-            if self.running:
-                self.running = False
-                save_state({"running": False, "last_run": load_state().get("last_run"), "processed": 0})
-                self.add_log("Service stopped")
-
-    def run(self):
-        async def async_main():
-            processed_addresses = load_processed_addresses()
-            async with aiohttp.ClientSession() as session:
-                while self.running:
-                    try:
-                        tokens = fetch_top_tokens(self.parameters['api_key'],
-                                                self.parameters['min_liquidity_top'])
-                        if not tokens:
-                            self.add_log("Warning: No tokens fetched")
-                            await asyncio.sleep(1)
-                            continue
-                        
-                        new_tokens = [t for t in tokens if t['address'] not in processed_addresses]
-                        if not new_tokens:
-                            self.add_log("No new tokens to process")
-                            await asyncio.sleep(1)
-                            continue
-                        
-                        self.add_log(f"Processing {len(new_tokens)} new tokens")
-                        opportunities = []
-                        for token in new_tokens:
-                            result = await analyze_token(session, token, self)
-                            if result:
-                                to_del = None
-                                for o in opportunities:
-                                    if result['address'] == o['address']:
-                                        to_del = o
-                                if to_del is not None:
-                                    opportunities.pop(to_del)
-                                
-                                opportunities.append(result)
-                                df = pd.DataFrame(opportunities)
-                                existing = load_results()
-                                updated = pd.concat([existing, df], ignore_index=True)
-
-                                save_results(updated)
-                                processed_addresses.update(df['address'].tolist())
-
-                            await asyncio.sleep(self.parameters['delay_between_tokens'])
-
-                        await asyncio.sleep(self.parameters['delay_between_cycles'])
-                    except Exception as e:
-                        self.add_log(f"Critical error: {str(e)}")
-                        await asyncio.sleep(1)
-
-        asyncio.run(async_main())
-
-# ======================
-# Streamlit UI
-# ======================
-if 'scanner' not in st.session_state:
-    st.session_state.scanner = ScannerService()
-
-st.title("🔍 Solana Token Scanner (24/7 Service)")
-
-# Sidebar controls
-with st.sidebar:
-    st.header("Configuration Panel")
     
-    # API Settings
-    st.subheader("API Settings")
-    api_key = st.text_input("BirdEye API Key", 
-                          value=st.session_state.scanner.parameters['api_key'],
-                          type="password")
-    
-    # Top Tokens Filter
-    st.subheader("Top Tokens Filter")
-    min_liquidity_top = st.number_input("Minimum Liquidity ($)", 
-                                      value=st.session_state.scanner.parameters['min_liquidity_top'],
-                                      min_value=0)
-    
-    # Analysis Criteria
-    st.subheader("Analysis Criteria")
-    min_liquidity = st.number_input("Minimum Liquidity ($)", 
-                                  value=st.session_state.scanner.parameters['min_liquidity'],
-                                  min_value=0)
-    min_volume = st.number_input("Minimum 24h Volume ($)", 
-                               value=st.session_state.scanner.parameters['min_volume'],
-                               min_value=0)
-    min_price_change_24h = st.number_input("Minimum 24h Price Change (%)", 
-                                         value=st.session_state.scanner.parameters['min_price_change_24h'],
-                                         min_value=0.0,
-                                         format="%.1f")
-    min_price = st.number_input("Minimum Price ($)", 
-                              value=st.session_state.scanner.parameters['min_price'],
-                              format="%.5f")
-    min_volatility = st.number_input("Minimum Volatility (%)", 
-                                   value=st.session_state.scanner.parameters['min_volatility'],
-                                   min_value=0.0,
-                                   format="%.1f")
-    max_volatility = st.number_input("Maximum Volatility (%)", 
-                                   value=st.session_state.scanner.parameters['max_volatility'],
-                                   min_value=0.0,
-                                   format="%.1f")
-    min_3period_change = st.number_input("Minimum 3-Period Momentum (%)", 
-                                       value=st.session_state.scanner.parameters['min_3period_change'],
-                                       min_value=0.0,
-                                       format="%.1f")
-    
-    # Historical Data
-    st.subheader("Historical Data")
-    historical_hours = st.slider("Analysis Window (hours)", 
-                               min_value=1, max_value=48, 
-                               value=st.session_state.scanner.parameters['historical_hours'])
-    historical_interval = st.selectbox("Candle Interval", 
-                                     options=['1H', '2H', '4H', '6H', '8H', '12H', '1D'],
-                                     index=1)
-    
-    # Advanced Settings
-    st.subheader("Advanced Settings")
-    max_retries = st.number_input("API Retry Attempts", 
-                                min_value=1, max_value=10, 
-                                value=st.session_state.scanner.parameters['max_retries'])
-    delay_between_tokens = st.number_input("Delay Between Tokens (sec)", 
-                                         min_value=0, max_value=60, 
-                                         value=st.session_state.scanner.parameters['delay_between_tokens'])
-    delay_between_cycles = st.number_input("Delay Between Cycles (sec)", 
-                                         min_value=0, max_value=3600, 
-                                         value=st.session_state.scanner.parameters['delay_between_cycles'])
-    stablecoins = st.multiselect("Exclude Stablecoins", 
-                               options=['USDC', 'USDT', 'USDH', 'BUSD', 'DAI', 'PAI'],
-                               default=st.session_state.scanner.parameters['stablecoins'])
+    if 'results' not in st.session_state:
+        st.session_state.results = load_results()
 
-# Control buttons
-col1, col2, col3 = st.columns(3)
-with col1:
-    if st.button("▶️ Start Service"):
-        st.session_state.scanner.parameters.update({
-            'api_key': api_key,
-            'min_liquidity_top': min_liquidity_top,
-            'min_liquidity': min_liquidity,
-            'min_volume': min_volume,
-            'min_price_change_24h': min_price_change_24h,
-            'min_price': min_price,
-            'max_volatility': max_volatility,
-            'min_volatility': min_volatility,
-            'min_3period_change': min_3period_change,
-            'historical_hours': historical_hours,
-            'historical_interval': historical_interval,
-            'max_retries': max_retries,
-            'delay_between_tokens': delay_between_tokens,
-            'delay_between_cycles': delay_between_cycles,
-            'stablecoins': stablecoins
-        })
-        st.session_state.scanner.start()
-with col2:
-    if st.button("⏹️ Stop Service"):
-        st.session_state.scanner.stop()
-with col3:
-    show_logs = st.button("📜 View Logs")
+    # Sidebar Controls
+    with st.sidebar:
+        st.header("Analysis Parameters")
+        
+        st.session_state.params['min_mcap'] = st.number_input(
+            "Minimum Market Cap (USD)", 
+            value=1e9, 
+            format="%.0f", 
+            step=1e6
+        )
+        
+        st.session_state.params['min_volume'] = st.number_input(
+            "Minimum 24h Volume (USD)", 
+            value=5e7, 
+            format="%.0f",
+            step=1e5
+        )
+        
+        st.session_state.params['min_price'] = st.number_input(
+            "Minimum Price (USD)", 
+            value=1.0, 
+            step=0.1,
+            format="%.2f"
+        )
+        
+        st.session_state.params['min_change_24h'] = st.number_input(
+            "Minimum 24h Change (%)", 
+            value=2.0, 
+            step=0.1
+        )
+        
+        st.session_state.params['min_volume_ratio'] = st.slider(
+            "Volume/MCap Ratio (%)", 
+            0.0, 10.0, 0.5, 0.1
+        )
+        
+        st.session_state.params['min_vwap_deviation'] = st.slider(
+            "VWAP Deviation (%)", 
+            -10.0, 10.0, -2.0, 0.1
+        )
+        
+        st.session_state.params['min_liquidity_score'] = st.slider(
+            "Liquidity Score Threshold", 
+            0.0, 100.0, 50.0, 1.0
+        )
 
-# Status display
-current_state = load_state()
-status_info = []
-if current_state.get("running", False):
-    status_info.append("**Status:** 🟢 Running")
-else:
-    status_info.append("**Status:** 🔴 Stopped")
+        if st.button("🚀 Run Analysis", type="primary"):
+            with st.spinner("Scanning crypto markets..."):
+                start_time = time.time()
+                raw_assets = fetch_assets()
+                processed_assets = [process_asset(a) for a in raw_assets]
+                filtered_assets = [
+                    a for a in processed_assets 
+                    if a['symbol'] not in st.session_state.params['excluded_assets']
+                ]
+                
+                analyzer = AssetAnalyzer(st.session_state.params)
+                new_results = []
+                
+                for asset in filtered_assets:
+                    result = analyzer.analyze(asset)
+                    if result:
+                        new_results.append(result)
+                
+                if new_results:
+                    new_df = pd.DataFrame(new_results)
+                    st.session_state.results = pd.concat(
+                        [st.session_state.results, new_df], 
+                        ignore_index=True
+                    )
+                    save_results(st.session_state.results)
+                    st.success(f"Found {len(new_results)} new opportunities!")
+                else:
+                    st.warning("No assets matching current criteria")
+                
+                st.write(f"Analysis completed in {time.time() - start_time:.2f} seconds")
 
-if current_state.get("last_run"):
-    status_info.append(f"**Last scan:** {current_state['last_run']}")
-if current_state.get("processed"):
-    status_info.append(f"**Processed:** {current_state['processed']} tokens")
+        st.download_button(
+            "💾 Download Results",
+            data=st.session_state.results.to_csv(index=False),
+            file_name="crypto_opportunities.csv",
+            mime="text/csv"
+        )
 
-st.markdown("\n\n".join(status_info))
+        if st.button("🔄 Clear Results"):
+            st.session_state.results = pd.DataFrame(columns=load_results().columns)
+            save_results(st.session_state.results)
+            st.success("Results cleared successfully")
 
-# Results display
-try:
-    df = load_results()
-    if not df.empty:
+    # Main Display
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Total Opportunities", len(st.session_state.results))
+    with col2:
+        if not st.session_state.results.empty and 'timestamp' in st.session_state.results:
+            recent_count = len(st.session_state.results[
+                pd.to_datetime(st.session_state.results['timestamp']) > 
+                (datetime.now() - timedelta(hours=24))
+            ])
+            st.metric("24h New Opportunities", recent_count)
+        else:
+            st.metric("24h New Opportunities", 0)
+
+    # Results Display
+    if not st.session_state.results.empty:
+        display_df = st.session_state.results.copy()
+        
+        # Ensure all columns exist
+        for col in ['price', 'market_cap', 'volume_24h', 'change_24h', 
+                   'vwap_deviation_pct', 'supply_utilization', 
+                   'volume_mcap_ratio', 'liquidity_score']:
+            if col not in display_df.columns:
+                display_df[col] = 0.0
+
+        # Format display values
+        display_df['price'] = display_df['price'].apply(
+            lambda x: f"${x:,.2f}" if pd.notnull(x) else "N/A")
+        display_df['market_cap'] = display_df['market_cap'].apply(
+            lambda x: f"${x/1e9:,.2f}B" if x >= 1e9 else f"${x/1e6:,.2f}M")
+        display_df['volume_24h'] = display_df['volume_24h'].apply(
+            lambda x: f"${x/1e6:,.2f}M" if pd.notnull(x) else "N/A")
+        display_df['change_24h'] = display_df['change_24h'].apply(
+            lambda x: f"{x:.2f}")
+        display_df['vwap_deviation_pct'] = display_df['vwap_deviation_pct'].apply(
+            lambda x: f"{x:.2f}%")
+        display_df['supply_utilization'] = display_df['supply_utilization'].apply(
+            lambda x: f"{x:.2f}%")
+        display_df['volume_mcap_ratio'] = display_df['volume_mcap_ratio'].apply(
+            lambda x: f"{x:.2f}%")
+        display_df['liquidity_score'] = display_df['liquidity_score'].apply(
+            lambda x: f"{x:.2f}/100")
+
         st.dataframe(
-            df.sort_values('timestamp', ascending=False).head(20),
-            height=500,
-            use_container_width=True
+            display_df.sort_values('timestamp', ascending=False),
+            column_config={
+                'symbol': 'Symbol',
+                'price': 'Price',
+                'market_cap': 'Market Cap',
+                'volume_24h': '24h Volume',
+                'change_24h': st.column_config.NumberColumn(
+                    '24h Change',
+                    format="%.2f%%"
+                ),
+                'vwap_deviation_pct': 'VWAP Deviation',
+                'supply_utilization': st.column_config.ProgressColumn(
+                    'Supply Utilization',
+                    format="%.2f%%",
+                    min_value=0,
+                    max_value=100
+                ),
+                'volume_mcap_ratio': 'Volume/MCap',
+                'liquidity_score': 'Liquidity Score'
+            },
+            height=600,
+            use_container_width=True,
+            hide_index=True
         )
     else:
-        st.info("No results found yet")
-except Exception as e:
-    st.error(f"Error loading results: {str(e)}")
-
-# Logs display
-if show_logs:
-    st.subheader("System Logs")
-    logs = st.session_state.scanner.get_logs()
-    if logs:
-        for log in reversed(logs[-20:]):
-            st.code(f"{log['timestamp']} - {log['message']}")
-    else:
-        st.info("No logs available yet")
-
-# Background service management
-if current_state.get("running") and not st.session_state.scanner.running:
-    st.session_state.scanner.start()
+        st.info("Run analysis to discover market opportunities")
 
 if __name__ == "__main__":
-    while True:
-        try:
-            state = load_state()
-            if state.get("running"):
-                if not st.session_state.scanner.running:
-                    st.session_state.scanner.start()
-        except KeyboardInterrupt:
-            break
+    main()
