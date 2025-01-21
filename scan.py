@@ -83,7 +83,6 @@ class TokenAnalyzer:
                     reasons.append(f'Failed {check_name}: {msg}')
                     passed = False
                 else:
-                    st.error(3)
                     reasons.append(f'Passed {check_name}')
 
             return passed, reasons
