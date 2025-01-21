@@ -156,7 +156,7 @@ class TokenAnalyzer:
                                     .get('lastJupiterSellPrice', 0)
             }
         except Exception as e:
-            print(f"Price data error: {str(e)}")
+            st.error(f"Price data error: {str(e)}")
             return None
 
 class AnalysisManager:
