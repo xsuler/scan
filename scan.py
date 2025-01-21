@@ -184,25 +184,49 @@ class TokenAnalyzer:
             return 0
 
 def save_checkpoint(data):
-    """Save checkpoint with serializable data only"""
-    serializable_data = {
-        'running': data['running'],
-        'results': data['results'],
-        'params': data['params'],
-        'processed': data['processed'],
-        'total': data['total']
+    """Save checkpoint with only serializable data"""
+    checkpoint = {
+        'running': data.get('running', False),
+        'results': data.get('results', []),
+        'params': data.get('params', None),
+        'processed': data.get('processed', 0),
+        'total': data.get('total', 0)
     }
     with open(CHECKPOINT_FILE, 'w') as f:
-        json.dump(serializable_data, f)
+        json.dump(checkpoint, f)
 
 def load_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
+    """Load checkpoint with safety checks"""
+    if not os.path.exists(CHECKPOINT_FILE):
+        return None
+    
+    try:
         with open(CHECKPOINT_FILE, 'r') as f:
             data = json.load(f)
-            # Recreate generator state from params
-            data['current_batch'] = []
+            
+            # Validate required fields
+            required_fields = ['params', 'processed', 'total', 'results']
+            for field in required_fields:
+                if field not in data:
+                    st.error(f"Invalid checkpoint: Missing {field}")
+                    clear_checkpoint()
+                    return None
+                    
+            # Validate params structure
+            if 'tokens' not in data['params'] or 'min_mcap' not in data['params']:
+                st.error("Invalid checkpoint: Corrupted parameters")
+                clear_checkpoint()
+                return None
+                
             return data
-    return None
+    except json.JSONDecodeError:
+        st.error("Corrupted checkpoint file")
+        clear_checkpoint()
+        return None
+    except Exception as e:
+        st.error(f"Checkpoint loading failed: {str(e)}")
+        clear_checkpoint()
+        return None
 
 def clear_checkpoint():
     if os.path.exists(CHECKPOINT_FILE):
@@ -212,12 +236,11 @@ def initialize_session_state():
     required_keys = {
         'analysis': {
             'running': False,
+            'generator': None,
             'results': [],
             'params': None,
             'processed': 0,
-            'total': 0,
-            'current_batch': [],
-            'generator': None
+            'total': 0
         },
         'analysis_results': pd.DataFrame()
     }
@@ -243,18 +266,27 @@ def main():
         def start_analysis():
             checkpoint = load_checkpoint()
             if checkpoint:
-                # Recreate generator from checkpoint data
-                st.session_state.analysis = {
-                    'running': True,
-                    'results': checkpoint['results'],
-                    'params': checkpoint['params'],
-                    'processed': checkpoint['processed'],
-                    'total': checkpoint['total'],
-                    'generator': analyzer.analyze_generator(
-                        checkpoint['params']['tokens'][checkpoint['processed']:],
-                        checkpoint['params']['min_mcap']
-                    )
-                }
+                try:
+                    # Validate token list integrity
+                    if len(checkpoint['params']['tokens']) != checkpoint['total']:
+                        raise ValueError("Token list mismatch")
+                        
+                    st.session_state.analysis = {
+                        'running': True,
+                        'generator': analyzer.analyze_generator(
+                            checkpoint['params']['tokens'][checkpoint['processed']:],
+                            checkpoint['params']['min_mcap']
+                        ),
+                        'results': checkpoint['results'],
+                        'params': checkpoint['params'],
+                        'processed': checkpoint['processed'],
+                        'total': checkpoint['total']
+                    }
+                except Exception as e:
+                    st.error(f"Checkpoint invalid: {str(e)}")
+                    clear_checkpoint()
+                    st.session_state.analysis['running'] = False
+                    return
             else:
                 tokens = analyzer.get_all_tokens(strict_checks=strict_mode)
                 if not tokens:
@@ -274,6 +306,7 @@ def main():
                     'total': len(tokens)
                 }
             save_checkpoint(st.session_state.analysis)
+            st.rerun()
 
         def stop_analysis():
             st.session_state.analysis['running'] = False
