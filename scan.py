@@ -115,10 +115,10 @@ class TokenAnalyzer:
 
     def calculate_rating(self, analysis):
         try:
-            liquidity_score = analysis['liquidity'] * 0.4
-            price_stability = (1 - abs(analysis['buy_price'] - analysis['sell_price'])/analysis['price']) * 0.3 if analysis['price'] != 0 else 0
-            market_depth = (1 - (analysis['price_impact_10'] + analysis['price_impact_100'])/2) * 0.3
-            return min(100.0, (liquidity_score + price_stability + market_depth) * 100)
+            liquidity = analysis['liquidity']
+            price_stability = (1 - abs(analysis['buy_price'] - analysis['sell_price'])/analysis['price']) if analysis['price'] != 0 else 0
+            market_depth = (1 - (analysis['price_impact_10'] + analysis['price_impact_100'])/2)
+            return liquidity + price_stability + market_depth
         except KeyError as e:
             print(f"Missing key in rating calculation: {str(e)}")
             return 0.0
@@ -189,7 +189,6 @@ class AnalysisManager:
 
         idx = st.session_state.analysis['current_index']
         tokens = st.session_state.analysis['tokens']
-        params = st.session_state.analysis['params']
         
         if idx < len(tokens):
             token = tokens[idx]
@@ -197,13 +196,11 @@ class AnalysisManager:
             
             if analysis is not None:
                 st.session_state.analysis['current_token'] = token
-                
-                if analysis['rating'] >= params['min_rating']:
-                    new_row = pd.DataFrame([analysis])
-                    st.session_state.live_results = pd.concat(
-                        [st.session_state.live_results, new_row],
-                        ignore_index=True
-                    )
+                new_row = pd.DataFrame([analysis])
+                st.session_state.live_results = pd.concat(
+                    [st.session_state.live_results, new_row],
+                    ignore_index=True
+                )
 
             st.session_state.analysis['progress'] = idx + 1
             st.session_state.analysis['current_index'] += 1
@@ -228,14 +225,12 @@ class UIManager:
 
     def render_sidebar(self):
         with st.sidebar:
+            st.title("Real-time Solana Token Analyzer")
             st.image("https://jup.ag/svg/jupiter-logo.svg", width=200)
-            st.header("Analysis Controls")
             
             with st.expander("⚙️ Core Settings", expanded=True):
                 params = {
-                    'min_rating': st.slider("Minimum Rating", 0, 100, 65),
-                    'strict_mode': st.checkbox("Strict Validation", True),
-                    'min_liquidity': st.slider("Min Liquidity Score", 0, 100, 50)
+                    'strict_mode': st.checkbox("Strict Validation", True)
                 }
 
             col1, col2 = st.columns(2)
@@ -254,6 +249,10 @@ class UIManager:
             if st.session_state.analysis.get('running', False):
                 self.render_progress()
                 self.render_current_token()
+
+            if not st.session_state.live_results.empty:
+                st.divider()
+                self.render_sidebar_results()
 
     def render_progress(self):
         analysis = st.session_state.analysis
@@ -286,27 +285,16 @@ class UIManager:
         else:
             st.error("No tokens found matching criteria")
 
-    def render_main(self):
-        st.title("Real-time Solana Token Analyzer")
-        
-        if st.session_state.analysis.get('running', False):
-            self.manager.process_tokens()
-        
-        results_placeholder = st.empty()
-        if not st.session_state.live_results.empty:
-            with results_placeholder.container():
-                self.render_results_table()
-                self.render_metrics()
-
-    def render_results_table(self):
+    def render_sidebar_results(self):
+        st.subheader("Real-time Analysis Results")
         df = st.session_state.live_results.sort_values('rating', ascending=False)
         st.data_editor(
             df,
             column_config={
                 'symbol': 'Symbol',
                 'price': st.column_config.NumberColumn('Price', format="$%.4f"),
-                'rating': st.column_config.ProgressColumn('Rating', format="%.1f"),
-                'liquidity': 'Liquidity',
+                'rating': st.column_config.NumberColumn('Score', format="%.1f"),
+                'liquidity': st.column_config.NumberColumn('Liquidity', format="%.1f"),
                 'explorer': st.column_config.LinkColumn('Explorer'),
                 'confidence': 'Confidence'
             },
@@ -315,19 +303,18 @@ class UIManager:
             hide_index=True,
             key="live_results_table"
         )
+        
+        cols = st.columns(3)
+        with cols[0]:
+            st.metric("Average Score", f"{df['rating'].mean():.1f}")
+        with cols[1]:
+            st.metric("Top Liquidity", f"{df['liquidity'].max():.1f}")
+        with cols[2]:
+            st.metric("High Confidence", df[df['confidence'] == 'high'].shape[0])
 
-    def render_metrics(self):
-        cols = st.columns(4)
-        df = st.session_state.live_results
-        if not df.empty:
-            with cols[0]:
-                st.metric("Average Rating", f"{df['rating'].mean():.1f}")
-            with cols[1]:
-                st.metric("Top Price", f"${df['price'].max():.4f}")
-            with cols[2]:
-                st.metric("Avg Liquidity", f"{df['liquidity'].mean():.1f}")
-            with cols[3]:
-                st.metric("High Confidence", df[df['confidence'] == 'high'].shape[0])
+    def render_main(self):
+        if st.session_state.analysis.get('running', False):
+            self.manager.process_tokens()
 
 if __name__ == "__main__":
     analyzer = TokenAnalyzer()
