@@ -206,8 +206,6 @@ class AnalysisManager:
         speed = analysis['progress'] / elapsed if elapsed > 0 else 0
 
         with st.session_state.ui['container']:
-            cols = st.columns([3, 1])
-            with cols[0]:
                 st.session_state.ui['progress'].progress(
                     analysis['progress'] / metrics['total_tokens']
                 )
@@ -218,7 +216,6 @@ class AnalysisManager:
                 """
                 st.session_state.ui['status'].markdown(status_text)
             
-            with cols[1]:
                 metrics_text = f"""
                 ⚡ **Speed:** {speed:.1f}/sec  
                 ⏱️ **Elapsed:** {elapsed:.1f}s  
