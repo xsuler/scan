@@ -74,8 +74,6 @@ class TokenAnalyzer:
     def analyze_token(self, token):
         try:
             price_data = self.get_token_price_data(token)
-            if price_data is None:
-                return None
             analysis = {
                 'symbol': token.get('symbol', 'Unknown'),
                 'address': token['address'],
@@ -95,7 +93,7 @@ class TokenAnalyzer:
             analysis['rating'] = self.calculate_rating(analysis)
             return analysis
         except Exception as e:
-            st.error(f"Analysis failed for {token.get('symbol')}: {str(e)} {traceback.format_exc()}")
+            st.error(f"Analysis failed for {token.get('symbol')}: {str(e)} {price_data}")
             return None
 
     def calculate_liquidity_score(self, token):
@@ -125,7 +123,8 @@ class TokenAnalyzer:
             return 0.0
 
     def get_token_price_data(self, token):
-        try:
+        while True:
+          try:
             response = self.session.get(
                 f"{JUPITER_PRICE_API}?ids={token['address']}&showExtraInfo=true",
                 timeout=15
@@ -134,7 +133,7 @@ class TokenAnalyzer:
             data = response.json()
             price_data = data.get('data', {}).get(token['address'], {})
             if not price_data:
-                return None
+                continue
                 
             extra_info = price_data.get('extraInfo', {})
             return {
@@ -156,9 +155,9 @@ class TokenAnalyzer:
                 'last_sell_price': extra_info.get('lastSwappedPrice', {})
                                     .get('lastJupiterSellPrice', 0)
             }
-        except Exception as e:
+          except Exception as e:
             st.error(f"Price data error: {str(e)}")
-            return None
+            
 
 class AnalysisManager:
     def __init__(self, analyzer):
