@@ -52,7 +52,7 @@ class TokenAnalyzer:
                     debug_entry['reasons'].append(f'Validation error: {str(e)}')
                     
                 self.debug_info.append(debug_entry)
-             st.error(len(vald_tokens)) 
+            st.error(len(vald_tokens)) 
             return valid_tokens
             
         except Exception as e:
