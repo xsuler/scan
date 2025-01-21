@@ -128,7 +128,6 @@ class TokenAnalyzer:
             return 0.0
 
     def get_token_price_data(self, token):
-        while True:
           try:
             response = self.session.get(
                 f"{JUPITER_PRICE_API}?ids={token['address']}&showExtraInfo=true",
@@ -138,7 +137,7 @@ class TokenAnalyzer:
             data = response.json()
             price_data = data.get('data', {}).get(token['address'], {})
             if not price_data:
-                continue
+                return None
                 
             extra_info = price_data.get('extraInfo', {})
             return {
@@ -162,6 +161,7 @@ class TokenAnalyzer:
             }
           except Exception as e:
             st.error(f"Price data error: {str(e)}")
+            return None
             
 
 class AnalysisManager:
