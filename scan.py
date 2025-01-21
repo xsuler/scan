@@ -192,20 +192,13 @@ class AnalysisManager:
         self.process_tokens(tokens)
 
     def create_ui(self):
-        # Create main container first
+        # Create container and columns in separate contexts
         st.session_state.ui['container'] = st.empty()
-        container = st.session_state.ui['container'].container()
-        
-        with container:
-            st.subheader("Live Analysis Dashboard")
+        with st.session_state.ui['container']:
             cols = st.columns([3, 1])
-            
-            # Progress column
             with cols[0]:
                 st.session_state.ui['progress'] = st.progress(0)
                 st.session_state.ui['status'] = st.empty()
-            
-            # Metrics column
             with cols[1]:
                 st.session_state.ui['metrics'] = st.empty()
 
@@ -215,10 +208,8 @@ class AnalysisManager:
         elapsed = time.time() - metrics['start_time']
         speed = analysis['progress'] / elapsed if elapsed > 0 else 0
 
-        container = st.session_state.ui['container'].container()
-        with container:
+        with st.session_state.ui['container']:
             cols = st.columns([3, 1])
-            
             with cols[0]:
                 st.session_state.ui['progress'].progress(
                     analysis['progress'] / metrics['total_tokens']
