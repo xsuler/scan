@@ -75,7 +75,7 @@ class TokenAnalyzer:
                 return False, reasons
 
             checks = [
-                    ('tag', lambda: token.get('tag')=="verified", 'Missing symbol'),
+                    ('tag', lambda: "birdeye-trending" in token.get('tags'), 'Missing symbol'),
                 ]
 
             passed = True
