@@ -14,8 +14,8 @@ JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 UI_REFRESH_INTERVAL = 0.01
-ROW_HEIGHT = 35  # 每行高度（像素）
-HEADER_HEIGHT = 50  # 表头高度（像素）
+ROW_HEIGHT = 35
+HEADER_HEIGHT = 50
 
 class TokenAnalyzer:
     def __init__(self):
@@ -67,7 +67,7 @@ class TokenAnalyzer:
             debug_entry['valid'] = True
             return True
         except Exception as e:
-            debug_entry['reasons'].append(f'Validation error: {str(e)}')
+            debug_entry['reasons'].append(f"Validation error: {str(e)}")
             return False
         finally:
             self.debug_info.append(debug_entry)
@@ -82,6 +82,7 @@ class TokenAnalyzer:
         try:
             price_data = self.get_token_price_data(token)
             analysis = {
+                'score': 0.0,  # Placeholder for score
                 'symbol': token.get('symbol', 'Unknown'),
                 'address': token['address'],
                 'price': self.safe_float(price_data.get('price', 0)),
@@ -263,7 +264,34 @@ class UIManager:
         self.analyzer = analyzer
         self.manager = AnalysisManager(analyzer)
 
+    def apply_custom_style(self):
+        st.markdown(
+            """
+            <style>
+                section[data-testid="stSidebar"] {
+                    width: 100% !important;
+                    max-width: 100% !important;
+                }
+                .stApp {
+                    margin-left: 0;
+                }
+                .st-emotion-cache-uf99v8 {
+                    padding: 0;
+                    width: 100%;
+                }
+                div[data-testid="stExpander"] {
+                    width: 100%;
+                }
+                div[data-testid="stVerticalBlock"] {
+                    gap: 0.5rem;
+                }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
     def render_sidebar(self):
+        self.apply_custom_style()
         with st.sidebar:
             st.title("🪙 Solana Token Analyzer")
             st.image("https://jup.ag/svg/jupiter-logo.svg", width=200)
@@ -329,37 +357,34 @@ class UIManager:
             st.error("No tokens found matching criteria")
 
     def calculate_table_height(self, df):
-        """动态计算表格高度"""
         num_rows = len(df)
         base_height = HEADER_HEIGHT + num_rows * ROW_HEIGHT
-        return min(base_height, 600)  # 设置最大高度限制
+        return min(base_height, 600)
 
     def render_sidebar_results(self):
         st.subheader("📊 Live Results")
         df = st.session_state.live_results
         
-        # 动态排序
-        sort_column = 'score'
-        sort_ascending = False
-        sorted_df = df.sort_values(by=sort_column, ascending=sort_ascending)
+        # Reorder columns with score first
+        column_order = ['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer']
+        sorted_df = df[column_order].sort_values(by='score', ascending=False)
         
-        # 动态计算高度
         table_height = self.calculate_table_height(sorted_df)
 
         st.data_editor(
             sorted_df,
             column_config={
-                'symbol': st.column_config.TextColumn(
-                    'Token',
-                    width='small',
-                    help="代币符号"
-                ),
                 'score': st.column_config.ProgressColumn(
                     'Score',
                     help="综合评分 (0-100)",
                     format="%.1f",
                     min_value=0,
                     max_value=100
+                ),
+                'symbol': st.column_config.TextColumn(
+                    'Token',
+                    width='small',
+                    help="代币符号"
                 ),
                 'price': st.column_config.NumberColumn(
                     'Price',
@@ -392,7 +417,6 @@ class UIManager:
             key="live_results_table"
         )
         
-        # 实时统计指标
         cols = st.columns(3)
         with cols[0]:
             st.metric("Avg Score", f"{df['score'].mean():.1f}")
@@ -402,11 +426,9 @@ class UIManager:
             st.metric("High Conf", df[df['confidence'] == 'high'].shape[0])
 
     def render_main(self):
-        if st.session_state.analysis.get('running', False):
-            self.manager.process_tokens()
+        pass
 
 if __name__ == "__main__":
     analyzer = TokenAnalyzer()
     ui = UIManager(analyzer)
     ui.render_sidebar()
-    ui.render_main()
