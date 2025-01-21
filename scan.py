@@ -289,16 +289,11 @@ class UIManager:
             return
 
         with st.expander("Current Token Details", expanded=True):
-            cols = st.columns([1, 3])
-            with cols[0]:
-                logo_uri = current_token.get('logoURI', 'https://via.placeholder.com/80')
-                st.image(logo_uri, width=60)
-            with cols[1]:
-                symbol = current_token.get('symbol', 'Unknown')
-                st.subheader(f"{symbol}")
-                address = current_token.get('address', '')
-                shortened_address = f"{address[:6]}...{address[-4:]}" if address else ''
-                st.caption(f"`{shortened_address}`")
+            symbol = current_token.get('symbol', 'Unknown')
+            st.subheader(f"{symbol}")
+            address = current_token.get('address', '')
+            shortened_address = f"{address[:6]}...{address[-4:]}" if address else ''
+            st.caption(f"`{shortened_address}`")
             
             price = current_analysis.get('price', 0.0) if current_analysis else 0.0
             market_cap = current_analysis.get('market_cap', 0.0) if current_analysis else 0.0
