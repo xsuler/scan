@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import traceback
-
 import requests
 import time
 import plotly.express as px
@@ -72,9 +71,7 @@ class TokenAnalyzer:
             self.debug_info.append(debug_entry)
 
     def ensure(self, v):
-        if v is None:
-            return 0
-        return v
+        return v or 0
 
     def analyze_token(self, token):
         try:
@@ -98,7 +95,7 @@ class TokenAnalyzer:
             analysis['rating'] = self.calculate_rating(analysis)
             return analysis
         except Exception as e:
-            st.error(f"Analysis failed for {token.get('symbol')}: {str(e)} {price_data}")
+            st.error(f"Analysis failed for {token.get('symbol')}: {str(e)}")
             return None
 
     def calculate_liquidity_score(self, token):
@@ -121,14 +118,13 @@ class TokenAnalyzer:
             liquidity_score = analysis['liquidity'] * 0.4
             price_stability = (1 - abs(analysis['buy_price'] - analysis['sell_price'])/analysis['price']) * 0.3 if analysis['price'] != 0 else 0
             market_depth = (1 - (analysis['price_impact_10'] + analysis['price_impact_100'])/2) * 0.3
-            
             return min(100.0, (liquidity_score + price_stability + market_depth) * 100)
         except KeyError as e:
             print(f"Missing key in rating calculation: {str(e)}")
             return 0.0
 
     def get_token_price_data(self, token):
-          try:
+        try:
             response = self.session.get(
                 f"{JUPITER_PRICE_API}?ids={token['address']}&showExtraInfo=true",
                 timeout=15
@@ -136,33 +132,20 @@ class TokenAnalyzer:
             response.raise_for_status()
             data = response.json()
             price_data = data.get('data', {}).get(token['address'], {})
-            if not price_data:
-                return None
-                
-            extra_info = price_data.get('extraInfo', {})
             return {
                 'price': price_data.get('price', 0),
                 'type': price_data.get('type', 'N/A'),
-                'confidence': extra_info.get('confidenceLevel', 'medium'),
-                'buy_price': extra_info.get('quotedPrice', {}).get('buyPrice', 0),
-                'sell_price': extra_info.get('quotedPrice', {}).get('sellPrice', 0),
-                'price_impact_10': extra_info.get('depth', {})
-                                   .get('sellPriceImpactRatio', {})
-                                   .get('depth', {})
-                                   .get('10', 0),
-                'price_impact_100': extra_info.get('depth', {})
-                                    .get('sellPriceImpactRatio', {})
-                                    .get('depth', {})
-                                    .get('100', 0),
-                'last_buy_price': extra_info.get('lastSwappedPrice', {})
-                                   .get('lastJupiterBuyPrice', 0),
-                'last_sell_price': extra_info.get('lastSwappedPrice', {})
-                                    .get('lastJupiterSellPrice', 0)
+                'confidence': price_data.get('extraInfo', {}).get('confidenceLevel', 'medium'),
+                'buy_price': price_data.get('extraInfo', {}).get('quotedPrice', {}).get('buyPrice', 0),
+                'sell_price': price_data.get('extraInfo', {}).get('quotedPrice', {}).get('sellPrice', 0),
+                'price_impact_10': price_data.get('extraInfo', {}).get('depth', {}).get('sellPriceImpactRatio', {}).get('depth', {}).get('10', 0),
+                'price_impact_100': price_data.get('extraInfo', {}).get('depth', {}).get('sellPriceImpactRatio', {}).get('depth', {}).get('100', 0),
+                'last_buy_price': price_data.get('extraInfo', {}).get('lastSwappedPrice', {}).get('lastJupiterBuyPrice', 0),
+                'last_sell_price': price_data.get('extraInfo', {}).get('lastSwappedPrice', {}).get('lastJupiterSellPrice', 0)
             }
-          except Exception as e:
+        except Exception as e:
             st.error(f"Price data error: {str(e)}")
             return None
-            
 
 class AnalysisManager:
     def __init__(self, analyzer):
@@ -174,13 +157,12 @@ class AnalysisManager:
             'analysis': {
                 'running': False,
                 'progress': 0,
-                'results': [],
                 'params': None,
                 'metrics': {'start_time': None, 'speed': 0},
                 'current_index': 0,
                 'current_token': None,
-                'current_analysis': None
-            }
+            },
+            'live_results': pd.DataFrame()
         }
         for key, val in defaults.items():
             st.session_state.setdefault(key, val)
@@ -189,7 +171,6 @@ class AnalysisManager:
         st.session_state.analysis = {
             'running': True,
             'progress': 0,
-            'results': [],
             'params': params,
             'metrics': {
                 'start_time': time.time(),
@@ -198,9 +179,9 @@ class AnalysisManager:
             },
             'current_index': 0,
             'tokens': tokens,
-            'current_token': None,
-            'current_analysis': None
+            'current_token': None
         }
+        st.session_state.live_results = pd.DataFrame()
 
     def process_tokens(self):
         if not st.session_state.analysis['running']:
@@ -208,20 +189,22 @@ class AnalysisManager:
 
         idx = st.session_state.analysis['current_index']
         tokens = st.session_state.analysis['tokens']
+        params = st.session_state.analysis['params']
         
         if idx < len(tokens):
             token = tokens[idx]
             analysis = self.analyzer.analyze_token(token)
             
-            # Only update current analysis if successful
             if analysis is not None:
                 st.session_state.analysis['current_token'] = token
-                st.session_state.analysis['current_analysis'] = analysis
                 
-                if analysis['rating'] >= st.session_state.analysis['params']['min_rating']:
-                    st.session_state.analysis['results'].append(analysis)
+                if analysis['rating'] >= params['min_rating']:
+                    new_row = pd.DataFrame([analysis])
+                    st.session_state.live_results = pd.concat(
+                        [st.session_state.live_results, new_row],
+                        ignore_index=True
+                    )
 
-            # Always update progress
             st.session_state.analysis['progress'] = idx + 1
             st.session_state.analysis['current_index'] += 1
             st.session_state.analysis['metrics']['speed'] = (idx + 1) / (
@@ -235,10 +218,8 @@ class AnalysisManager:
 
     def finalize_analysis(self):
         st.session_state.analysis['running'] = False
-        if st.session_state.analysis['results']:
-            st.session_state.results = pd.DataFrame(st.session_state.analysis['results'])
-        else:
-            st.session_state.results = pd.DataFrame()
+        if st.session_state.live_results.empty:
+            st.warning("No qualified tokens found during analysis")
 
 class UIManager:
     def __init__(self, analyzer):
@@ -263,7 +244,7 @@ class UIManager:
                     self.start_analysis(params)
             with col2:
                 if st.button("⏹ Stop Analysis", use_container_width=True):
-                    self.stop_analysis()
+                    self.manager.stop_analysis()
 
             st.divider()
             if st.button("🧹 Clear Data"):
@@ -278,40 +259,29 @@ class UIManager:
         analysis = st.session_state.analysis
         metrics = analysis['metrics']
         progress = analysis['progress'] / metrics['total_tokens']
-        elapsed = time.time() - metrics['start_time']
         
         st.progress(min(progress, 1.0))
-        st.metric("Processed Tokens", f"{analysis['progress']}/{metrics['total_tokens']}")
-        st.metric("Analysis Speed", f"{(analysis['progress']/elapsed):.1f} tkn/s" if elapsed > 0 else "N/A")
-        st.metric("Elapsed Time", f"{elapsed:.1f}s")
+        cols = st.columns(3)
+        with cols[0]:
+            st.metric("Processed", f"{analysis['progress']}/{metrics['total_tokens']}")
+        with cols[1]:
+            st.metric("Speed", f"{(analysis['metrics']['speed']):.1f} tkn/s")
+        with cols[2]:
+            st.metric("Found", f"{len(st.session_state.live_results)}")
 
     def render_current_token(self):
-        analysis_state = st.session_state.analysis
-        current_token = analysis_state.get('current_token')
-        current_analysis = analysis_state.get('current_analysis')
-
-        if not current_token or not current_analysis:
+        current_token = st.session_state.analysis.get('current_token')
+        if not current_token:
             return
 
-        with st.expander("Current Token Details", expanded=True):
-            symbol = current_token.get('symbol', 'Unknown')
-            st.subheader(f"{symbol}")
-            address = current_token.get('address', '')
-            shortened_address = f"{address[:6]}...{address[-4:]}" if address else ''
-            st.caption(f"`{shortened_address}`")
-            
-            cols = st.columns(2)
+        with st.expander("Current Token Analysis", expanded=True):
+            cols = st.columns([1, 3])
             with cols[0]:
-                st.metric("Current Price", f"${current_analysis.get('price', 0):.4f}")
-                st.metric("Buy Price", f"${current_analysis.get('buy_price', 0):.4f}")
-                st.metric("Price Impact (10)", 
-                         f"{current_analysis.get('price_impact_10', 0)*100:.2f}%")
-                
+                if current_token.get('logoURI'):
+                    st.image(current_token['logoURI'], width=80)
             with cols[1]:
-                st.metric("Confidence Level", current_analysis.get('confidence', 'N/A'))
-                st.metric("Sell Price", f"${current_analysis.get('sell_price', 0):.4f}")
-                st.metric("Price Impact (100)", 
-                         f"{current_analysis.get('price_impact_100', 0)*100:.2f}%")
+                st.subheader(current_token.get('symbol', 'Unknown'))
+                st.caption(f"`{current_token.get('address', '')[:12]}...`")
 
     def start_analysis(self, params):
         tokens = self.analyzer.get_all_tokens(params['strict_mode'])
@@ -321,77 +291,48 @@ class UIManager:
         else:
             st.error("No tokens found matching criteria")
 
-    def stop_analysis(self):
-        st.session_state.analysis['running'] = False
-        st.rerun()
-
     def render_main(self):
-        st.title("Advanced Solana Token Analyzer")
+        st.title("Real-time Solana Token Analyzer")
         
         if st.session_state.analysis.get('running', False):
             self.manager.process_tokens()
         
-        if st.session_state.get('results') is not None:
-            tab1, tab2, tab3 = st.tabs(["Analysis Results", "Market Depth", "Price Dynamics"])
-            
-            with tab1:
+        results_placeholder = st.empty()
+        if not st.session_state.live_results.empty:
+            with results_placeholder.container():
                 self.render_results_table()
-            
-            with tab2:
-                self.render_market_depth_charts()
-            
-            with tab3:
-                self.render_price_analysis()
+                self.render_metrics()
 
     def render_results_table(self):
-        if st.session_state.results.empty:
-            st.warning("No tokens matching the criteria found")
-            return
-            
-        df = st.session_state.results.sort_values('rating', ascending=False)
-        st.dataframe(
+        df = st.session_state.live_results.sort_values('rating', ascending=False)
+        st.data_editor(
             df,
             column_config={
                 'symbol': 'Symbol',
                 'price': st.column_config.NumberColumn('Price', format="$%.4f"),
                 'rating': st.column_config.ProgressColumn('Rating', format="%.1f"),
-                'liquidity': 'Liquidity Score',
-                'confidence': 'Confidence',
-                'buy_price': st.column_config.NumberColumn('Buy Price', format="$%.4f"),
-                'sell_price': st.column_config.NumberColumn('Sell Price', format="$%.4f"),
+                'liquidity': 'Liquidity',
+                'explorer': st.column_config.LinkColumn('Explorer'),
+                'confidence': 'Confidence'
             },
             height=600,
-            use_container_width=True
+            use_container_width=True,
+            hide_index=True,
+            key="live_results_table"
         )
 
-    def render_market_depth_charts(self):
-        if st.session_state.results.empty:
-            return
-            
-        df = st.session_state.results
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig = px.scatter(df, x='price_impact_10', y='price_impact_100',
-                           color='confidence', hover_data=['symbol'],
-                           title="Price Impact Analysis")
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            fig = px.density_heatmap(df, x='liquidity', y='rating',
-                                   marginal_x="histogram", marginal_y="histogram",
-                                   title="Liquidity vs Rating Distribution")
-            st.plotly_chart(fig, use_container_width=True)
-
-    def render_price_analysis(self):
-        if st.session_state.results.empty:
-            return
-            
-        df = st.session_state.results
-        fig = px.scatter_3d(df, x='price', y='buy_price', z='sell_price',
-                          color='rating', hover_name='symbol',
-                          title="3D Price Relationship Analysis")
-        st.plotly_chart(fig, use_container_width=True)
+    def render_metrics(self):
+        cols = st.columns(4)
+        df = st.session_state.live_results
+        if not df.empty:
+            with cols[0]:
+                st.metric("Average Rating", f"{df['rating'].mean():.1f}")
+            with cols[1]:
+                st.metric("Top Price", f"${df['price'].max():.4f}")
+            with cols[2]:
+                st.metric("Avg Liquidity", f"{df['liquidity'].mean():.1f}")
+            with cols[3]:
+                st.metric("High Confidence", df[df['confidence'] == 'high'].shape[0])
 
 if __name__ == "__main__":
     analyzer = TokenAnalyzer()
