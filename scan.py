@@ -31,7 +31,7 @@ class TokenAnalyzer:
             cutoff_date = datetime.now() - timedelta(days=days)
             response = self.session.get(JUPITER_TOKEN_LIST, timeout=15)
             tokens = response.json()
-            st.info(tokens)
+            st.info(tokens[0])
             
             recent_tokens = []
             for t in tokens:
