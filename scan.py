@@ -5,7 +5,6 @@ import base58
 import time
 from datetime import datetime
 from solders.pubkey import Pubkey
-from solders.rpc.config import RpcContextConfig
 from solana.rpc.api import Client
 
 # Configuration
@@ -14,7 +13,7 @@ SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
 RESULTS_FILE = "solana_contract_scan.csv"
 
 # Initialize Solana client
-solana_client = Client(SOLANA_RPC_ENDPOINT, config=RpcContextConfig())
+solana_client = Client(SOLANA_RPC_ENDPOINT)
 
 # ======================
 # Blockchain Data Functions
@@ -45,8 +44,8 @@ def get_token_details(mint_address: str):
     try:
         pubkey = Pubkey.from_string(mint_address)
         
-        # Get token supply
-        supply_info = solana_client.get_token_supply(pubkey)
+        # Get token supply with commitment level
+        supply_info = solana_client.get_token_supply(pubkey, commitment="confirmed")
         if not supply_info.value:
             return None
             
