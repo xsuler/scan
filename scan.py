@@ -295,7 +295,6 @@ class UIManager:
             if st.button("🧹 Clear Cache"):
                 clear_checkpoint()
                 st.session_state.clear()
-                st.rerun()
 
     def start_analysis(self, params):
         if checkpoint := load_checkpoint():
