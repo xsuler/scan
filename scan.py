@@ -10,9 +10,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # Configuration
+JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
-HISTORY_FILE = "token_ratings.csv"
+RESULTS_FILE = "token_analysis.csv"
+REQUEST_INTERVAL = 0.5  # Seconds between requests
 
 # Initialize Solana client
 solana_client = Client(SOLANA_RPC_ENDPOINT)
@@ -23,7 +25,7 @@ retries = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 class TokenAnalyzer:
-    """Professional token rating system with filtering"""
+    """Robust token analysis system with error protection"""
     
     RATING_WEIGHTS = {
         'liquidity': 0.4,
@@ -32,235 +34,231 @@ class TokenAnalyzer:
         'confidence': 0.1
     }
     
-    def __init__(self, mint_address):
-        self.mint_address = mint_address
-        self.raw_data = None
-        self.metrics = {
-            'price': 0.0,
-            'market_cap': 0.0,
-            'liquidity_score': 0.0,
-            'volatility_index': 0.0,
-            'depth_quality': 0.0,
-            'confidence_score': 0.0,
-            'overall_rating': 0.0,
-            'last_updated': None
-        }
+    def __init__(self):
+        self.token_list = []
+        self.analysis_results = pd.DataFrame()
         
-    def fetch_data(self):
-        """Fetch market data from Jupiter API"""
+    def fetch_token_list(self):
+        """Get all tokens from Jupiter with validation"""
         try:
-            response = session.get(
-                f"{JUPITER_PRICE_API}?ids={self.mint_address}&showExtraInfo=true",
-                timeout=10
-            )
-            if response.status_code == 200:
-                self.raw_data = response.json().get('data', {}).get(self.mint_address)
-                self._calculate_metrics()
-        except Exception as e:
-            st.error(f"API Error: {str(e)}")
-    
-    def _calculate_metrics(self):
-        """Calculate professional rating metrics"""
-        if not self.raw_data:
-            return
-            
-        try:
-            # Core metrics
-            extra_info = self.raw_data.get('extraInfo', {})
-            
-            # Liquidity score calculation
-            buy_depth = extra_info.get('depth', {}).get('buyPriceImpactRatio', {}).get('depth', {})
-            sell_depth = extra_info.get('depth', {}).get('sellPriceImpactRatio', {}).get('depth', {})
-            depth_impact = [
-                buy_depth.get('10', 0), buy_depth.get('100', 0), buy_depth.get('1000', 0),
-                sell_depth.get('10', 0), sell_depth.get('100', 0), sell_depth.get('1000', 0)
+            response = session.get(JUPITER_TOKEN_LIST, timeout=15)
+            response.raise_for_status()
+            tokens = response.json()
+            self.token_list = [
+                t for t in tokens 
+                if self._valid_mint(t.get('address')) 
+                and t.get('symbol') != 'SOL'
             ]
-            avg_impact = np.mean([x for x in depth_impact if x is not None])
-            self.metrics['liquidity_score'] = max(0, 100 - (avg_impact * 1000))
-            
-            # Volatility calculation
-            last_swap = extra_info.get('lastSwappedPrice', {})
-            buy_price = float(last_swap.get('lastJupiterBuyPrice', 0))
-            sell_price = float(last_swap.get('lastJupiterSellPrice', 0))
-            self.metrics['volatility_index'] = abs(buy_price - sell_price) / self.metrics['price'] * 100
-            
-            # Depth quality score
-            impact_values = [buy_depth.get('1000', 0), sell_depth.get('1000', 0)]
-            self.metrics['depth_quality'] = 90 if all(x < 0.1 for x in impact_values) else \
-                                          70 if all(x < 0.3 for x in impact_values) else 40
-            
-            # Confidence score
-            confidence_map = {'high': 90, 'medium': 70, 'low': 50, 'unknown': 30}
-            self.metrics['confidence_score'] = confidence_map.get(
-                extra_info.get('confidenceLevel', 'unknown').lower(), 30
-            )
-            
-            # Market cap calculation
-            supply_info = solana_client.get_token_supply(Pubkey.from_string(self.mint_address))
-            if supply_info.value:
-                supply = int(supply_info.value.amount) / 10 ** supply_info.value.decimals
-                self.metrics['market_cap'] = float(self.raw_data.get('price', 0)) * supply
-            
-            # Calculate overall rating
-            self.metrics['overall_rating'] = (
-                self.metrics['liquidity_score'] * self.RATING_WEIGHTS['liquidity'] +
-                (100 - self.metrics['volatility_index']) * self.RATING_WEIGHTS['volatility'] +
-                self.metrics['depth_quality'] * self.RATING_WEIGHTS['depth_quality'] +
-                self.metrics['confidence_score'] * self.RATING_WEIGHTS['confidence']
-            )
-            
-            self.metrics['last_updated'] = datetime.now().isoformat()
-            
+            return True
         except Exception as e:
-            st.error(f"Metric calculation error: {str(e)}")
-
-    def get_rating(self):
-        """Get professional rating report"""
-        return {
-            'Mint Address': self.mint_address,
-            'Price': f"${self.metrics['price']:.4f}",
-            'Market Cap': self.metrics['market_cap'],
-            'Overall Rating': f"{self.metrics['overall_rating']:.1f}/100",
-            'Liquidity Score': self.metrics['liquidity_score'],
-            'Volatility Index': self.metrics['volatility_index'],
-            'Depth Quality': self.metrics['depth_quality'],
-            'Confidence Score': self.metrics['confidence_score'],
-            'Last Updated': self.metrics['last_updated']
-        }
-
-def initialize_session():
-    """Initialize session state"""
-    if 'ratings_history' not in st.session_state:
+            st.error(f"Token list error: {str(e)}")
+            return False
+            
+    def _valid_mint(self, mint_address):
+        """Validate SPL token address"""
         try:
-            st.session_state.ratings_history = pd.read_csv(HISTORY_FILE)
+            Pubkey.from_string(mint_address)
+            return mint_address != "So11111111111111111111111111111111111111112"
         except:
-            st.session_state.ratings_history = pd.DataFrame(columns=[
-                'timestamp', 'mint_address', 'overall_rating', 'price',
-                'market_cap', 'liquidity_score', 'volatility_index',
-                'depth_quality', 'confidence_score'
-            ])
+            return False
 
-def save_history():
-    """Save ratings history"""
-    st.session_state.ratings_history.to_csv(HISTORY_FILE, index=False)
+    def _safe_float(self, value, default=0.0):
+        """Type-safe float conversion"""
+        try:
+            return float(value) if value not in [None, 'null', ''] else default
+        except:
+            return default
 
-def display_rating(report, min_score):
-    """Display professional rating card with filtering"""
-    rating = float(report['Overall Rating'].split('/')[0])
-    if rating < min_score:
-        return False
+    def analyze_tokens(self, progress_callback=None):
+        """Analyze all tokens with rate limiting"""
+        results = []
         
-    with st.expander(f"📈 {report['Mint Address'][:6]}...{report['Mint Address'][-6:]} - Rating: {rating:.1f}/100"):
-        cols = st.columns(4)
-        cols[0].metric("Overall Rating", report['Overall Rating'])
-        cols[1].metric("Liquidity Score", f"{report['Liquidity Score']:.1f}")
-        cols[2].metric("Volatility", f"{report['Volatility Index']:.2f}%")
-        cols[3].metric("Market Cap", f"${report['Market Cap']/1e6:.2f}M" if report['Market Cap'] > 1e6 else f"${report['Market Cap']:,.2f}")
-        
-        cols = st.columns(2)
-        cols[0].progress(report['Depth Quality']/100, f"Depth Quality: {report['Depth Quality']:.1f}")
-        cols[1].progress(report['Confidence Score']/100, f"Confidence: {report['Confidence Score']:.1f}")
-        
-    return True
+        for idx, token in enumerate(self.token_list):
+            try:
+                mint = token['address']
+                # Rate limit protection
+                if idx > 0:
+                    time.sleep(REQUEST_INTERVAL)
+                    
+                # Fetch price data
+                price_data = session.get(
+                    f"{JUPITER_PRICE_API}?ids={mint}&showExtraInfo=true",
+                    timeout=10
+                ).json().get('data', {}).get(mint, {})
+                
+                if not price_data:
+                    continue
+                    
+                # Get supply info
+                supply = 0
+                try:
+                    supply_info = solana_client.get_token_supply(Pubkey.from_string(mint))
+                    if supply_info.value:
+                        supply = int(supply_info.value.amount) / 10 ** supply_info.value.decimals
+                except:
+                    pass
+                
+                # Extract metrics with null safety
+                extra_info = price_data.get('extraInfo', {})
+                last_swap = extra_info.get('lastSwappedPrice', {})
+                
+                buy_price = self._safe_float(last_swap.get('lastJupiterBuyPrice'))
+                sell_price = self._safe_float(last_swap.get('lastJupiterSellPrice'))
+                current_price = self._safe_float(price_data.get('price'))
+                market_cap = current_price * supply
+                
+                # Calculate volatility
+                volatility = abs(buy_price - sell_price) / current_price * 100 if current_price else 0
+                
+                # Depth analysis
+                depth = extra_info.get('depth', {})
+                buy_depth = depth.get('buyPriceImpactRatio', {}).get('depth', {})
+                sell_depth = depth.get('sellPriceImpactRatio', {}).get('depth', {})
+                
+                # Liquidity score calculation
+                depth_metrics = [
+                    self._safe_float(buy_depth.get('10')),
+                    self._safe_float(buy_depth.get('100')),
+                    self._safe_float(buy_depth.get('1000')),
+                    self._safe_float(sell_depth.get('10')),
+                    self._safe_float(sell_depth.get('100')),
+                    self._safe_float(sell_depth.get('1000'))
+                ]
+                liquidity_score = max(0, 100 - (np.mean(depth_metrics) * 1000))
+                
+                # Confidence scoring
+                confidence_map = {'high': 90, 'medium': 70, 'low': 50}
+                confidence = confidence_map.get(
+                    extra_info.get('confidenceLevel', 'unknown').lower(), 30
+                )
+                
+                # Depth quality rating
+                impact_values = [
+                    self._safe_float(buy_depth.get('1000')),
+                    self._safe_float(sell_depth.get('1000'))
+                ]
+                depth_quality = (
+                    90 if all(x < 0.1 for x in impact_values) else
+                    70 if all(x < 0.3 for x in impact_values) else 40
+                )
+                
+                # Calculate overall rating
+                overall_rating = (
+                    liquidity_score * self.RATING_WEIGHTS['liquidity'] +
+                    (100 - volatility) * self.RATING_WEIGHTS['volatility'] +
+                    depth_quality * self.RATING_WEIGHTS['depth_quality'] +
+                    confidence * self.RATING_WEIGHTS['confidence']
+                )
+                
+                results.append({
+                    'symbol': token.get('symbol', 'Unknown').upper(),
+                    'mint': mint,
+                    'price': current_price,
+                    'market_cap': market_cap,
+                    'liquidity_score': liquidity_score,
+                    'volatility': volatility,
+                    'depth_quality': depth_quality,
+                    'confidence': confidence,
+                    'overall_rating': overall_rating,
+                    'timestamp': datetime.now().isoformat()
+                })
+                
+                if progress_callback:
+                    progress_callback((idx + 1) / len(self.token_list))
+                    
+            except Exception as e:
+                st.error(f"Error analyzing {token.get('symbol', 'unknown')}: {str(e)}")
+                continue
+                
+        self.analysis_results = pd.DataFrame(results)
+        return self.analysis_results
 
 def main():
-    st.set_page_config(page_title="Professional Token Rater", layout="wide")
-    st.title("🔍 Institutional Token Rating System")
+    st.set_page_config(page_title="Professional Token Analyzer", layout="wide")
+    st.title("📊 Institutional Token Analysis Platform")
     
-    initialize_session()
+    analyzer = TokenAnalyzer()
     
-    # Controls
+    if 'analysis_data' not in st.session_state:
+        st.session_state.analysis_data = pd.DataFrame()
+    
     with st.sidebar:
-        st.header("Rating Parameters")
-        min_score = st.slider("Minimum Rating Score", 0, 100, 70)
-        min_mcap = st.number_input("Minimum Market Cap (USD)", 0, 1000000000, 1000000)
-        max_volatility = st.slider("Maximum Volatility (%)", 0, 100, 30)
-        tokens = st.text_area("Token Addresses (comma separated)", 
-                            "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN, So11111111111111111111111111111111111111112")
+        st.header("Analysis Controls")
+        min_rating = st.slider("Minimum Rating Score", 0, 100, 70)
+        run_analysis = st.button("🚀 Run Full Market Analysis")
         
-        if st.button("💼 Run Professional Analysis", type="primary"):
-            with st.spinner("Analyzing tokens..."):
-                start_time = time.time()
-                valid_tokens = 0
-                
-                for mint in [m.strip() for m in tokens.split(',') if m.strip()]:
-                    analyzer = TokenAnalyzer(mint)
-                    analyzer.fetch_data()
-                    if analyzer.raw_data:
-                        report = analyzer.get_rating()
-                        if display_rating(report, min_score):
-                            # Add to history
-                            new_entry = {
-                                'timestamp': datetime.now().isoformat(),
-                                'mint_address': mint,
-                                'overall_rating': float(report['Overall Rating'].split('/')[0]),
-                                'price': float(report['Price'].replace('$', '')),
-                                'market_cap': report['Market Cap'],
-                                'liquidity_score': report['Liquidity Score'],
-                                'volatility_index': report['Volatility Index'],
-                                'depth_quality': report['Depth Quality'],
-                                'confidence_score': report['Confidence Score']
-                            }
-                            st.session_state.ratings_history = pd.concat([
-                                st.session_state.ratings_history,
-                                pd.DataFrame([new_entry])
-                            ], ignore_index=True)
-                            valid_tokens += 1
-                        time.sleep(0.3)  # Rate limiting
-                
-                save_history()
-                st.success(f"Analyzed {valid_tokens} tokens in {time.time() - start_time:.2f}s")
-        
-        st.download_button(
-            "📥 Download Full Report",
-            data=st.session_state.ratings_history.to_csv(index=False),
-            file_name="token_ratings.csv",
-            mime="text/csv"
-        )
-        
-        if st.button("🔄 Clear History"):
-            st.session_state.ratings_history = pd.DataFrame(columns=[
-                'timestamp', 'mint_address', 'overall_rating', 'price',
-                'market_cap', 'liquidity_score', 'volatility_index',
-                'depth_quality', 'confidence_score'
-            ])
-            save_history()
-            st.success("History cleared")
+        if st.session_state.analysis_data.empty:
+            st.warning("No analysis data available")
+        else:
+            st.download_button(
+                "💾 Export Full Report",
+                data=st.session_state.analysis_data.to_csv(index=False),
+                file_name=RESULTS_FILE,
+                mime="text/csv"
+            )
 
-    # Main display
-    if not st.session_state.ratings_history.empty:
-        st.subheader("Rating History")
+    if run_analysis:
+        with st.spinner("Loading token list..."):
+            if not analyzer.fetch_token_list():
+                st.error("Failed to load token list")
+                return
+                
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-        # Apply filters
-        filtered = st.session_state.ratings_history[
-            (st.session_state.ratings_history['overall_rating'] >= min_score) &
-            (st.session_state.ratings_history['market_cap'] >= min_mcap) &
-            (st.session_state.ratings_history['volatility_index'] <= max_volatility)
-        ]
+        def update_progress(progress):
+            progress_bar.progress(progress)
+            status_text.text(f"Analyzing market: {progress*100:.1f}% complete")
         
-        # Display dataframe
+        with st.spinner("Analyzing entire market..."):
+            start_time = time.time()
+            results = analyzer.analyze_tokens(progress_callback=update_progress)
+            st.session_state.analysis_data = results
+            duration = time.time() - start_time
+            
+        st.success(f"Analyzed {len(results)} tokens in {duration:.2f} seconds")
+        progress_bar.empty()
+        status_text.empty()
+    
+    if not st.session_state.analysis_data.empty:
+        filtered = st.session_state.analysis_data[
+            st.session_state.analysis_data['overall_rating'] >= min_rating
+        ].sort_values('overall_rating', ascending=False)
+        
+        st.subheader(f"Top Rated Tokens (Score ≥ {min_rating})")
+        
+        # Display metrics
+        cols = st.columns(4)
+        cols[0].metric("Total Analyzed", len(st.session_state.analysis_data))
+        cols[1].metric("Average Rating", 
+                      f"{st.session_state.analysis_data['overall_rating'].mean():.1f}/100")
+        cols[2].metric("High Quality Tokens", len(filtered))
+        cols[3].metric("Market Coverage", 
+                      f"{len(filtered)/len(st.session_state.analysis_data):.1%}")
+        
+        # Display results
         st.dataframe(
-            filtered.sort_values('overall_rating', ascending=False),
+            filtered,
             column_config={
-                'timestamp': 'Time',
-                'mint_address': 'Token',
-                'overall_rating': st.column_config.NumberColumn(
-                    'Rating', format="%.1f/100"
-                ),
+                'symbol': 'Symbol',
+                'mint': 'Contract Address',
                 'price': st.column_config.NumberColumn(
                     'Price', format="$%.4f"
                 ),
                 'market_cap': st.column_config.NumberColumn(
                     'Market Cap', format="$%.2f"
                 ),
+                'overall_rating': st.column_config.ProgressColumn(
+                    'Rating', format="%.1f", min_value=0, max_value=100
+                ),
                 'liquidity_score': 'Liquidity',
-                'volatility_index': 'Volatility %',
-                'depth_quality': 'Depth',
-                'confidence_score': 'Confidence'
+                'volatility': 'Volatility %',
+                'depth_quality': 'Depth Quality',
+                'confidence': 'Confidence'
             },
             hide_index=True,
             use_container_width=True,
-            height=500
+            height=600
         )
 
 if __name__ == "__main__":
