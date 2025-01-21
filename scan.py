@@ -107,12 +107,12 @@ class TokenAnalyzer:
             reasons.append(f'Validation error: {str(e)}')
             return False, reasons
 
-    def analyze_generator(self, tokens, min_mcap):
+    def analyze_batch(self, tokens, min_mcap, progress_callback=None):
         results = []
-        processed = 0
-        total = len(tokens)
-        
         for idx, token in enumerate(tokens):
+            if not st.session_state.analysis.get('running', True):
+                break
+                
             try:
                 analysis = self.deep_analyze(token)
                 if analysis and analysis['market_cap'] >= min_mcap:
@@ -120,15 +120,15 @@ class TokenAnalyzer:
             except Exception as e:
                 st.error(f"Skipping {token.get('symbol')}: {str(e)}")
             
-            processed = idx + 1
-            if (idx + 1) % BATCH_SIZE == 0 or processed == total:
-                yield {
-                    'processed': processed,
-                    'total': total,
-                    'results': results,
-                    'current_token': token
-                }
-                results = []
+            if progress_callback and (idx % BATCH_SIZE == 0 or idx == len(tokens)-1):
+                progress_callback(
+                    processed=idx+1,
+                    total=len(tokens),
+                    results=results,
+                    current_token=token
+                )
+                
+        return results
 
     def deep_analyze(self, token):
         try:
@@ -184,7 +184,6 @@ class TokenAnalyzer:
             return 0
 
 def save_checkpoint(data):
-    """Save checkpoint with only serializable data"""
     checkpoint = {
         'running': data.get('running', False),
         'results': data.get('results', []),
@@ -196,7 +195,6 @@ def save_checkpoint(data):
         json.dump(checkpoint, f)
 
 def load_checkpoint():
-    """Load checkpoint with safety checks"""
     if not os.path.exists(CHECKPOINT_FILE):
         return None
     
@@ -204,7 +202,6 @@ def load_checkpoint():
         with open(CHECKPOINT_FILE, 'r') as f:
             data = json.load(f)
             
-            # Validate required fields
             required_fields = ['params', 'processed', 'total', 'results']
             for field in required_fields:
                 if field not in data:
@@ -212,7 +209,6 @@ def load_checkpoint():
                     clear_checkpoint()
                     return None
                     
-            # Validate params structure
             if 'tokens' not in data['params'] or 'min_mcap' not in data['params']:
                 st.error("Invalid checkpoint: Corrupted parameters")
                 clear_checkpoint()
@@ -236,14 +232,13 @@ def initialize_session_state():
     required_keys = {
         'analysis': {
             'running': False,
-            'generator': None,
             'results': [],
             'params': None,
             'processed': 0,
             'total': 0
         },
         'analysis_results': pd.DataFrame(),
-        'progress_initialized': False
+        'progress_container': None
     }
     
     for key, default_value in required_keys.items():
@@ -273,10 +268,6 @@ def main():
                         
                     st.session_state.analysis = {
                         'running': True,
-                        'generator': analyzer.analyze_generator(
-                            checkpoint['params']['tokens'][checkpoint['processed']:],
-                            checkpoint['params']['min_mcap']
-                        ),
                         'results': checkpoint['results'],
                         'params': checkpoint['params'],
                         'processed': checkpoint['processed'],
@@ -295,7 +286,6 @@ def main():
                 
                 st.session_state.analysis = {
                     'running': True,
-                    'generator': analyzer.analyze_generator(tokens, min_mcap),
                     'results': [],
                     'params': {
                         'min_mcap': min_mcap,
@@ -307,11 +297,22 @@ def main():
                 }
             save_checkpoint(st.session_state.analysis)
             
+            if st.session_state.progress_container is None:
+                st.session_state.progress_container = st.empty()
+            
+            with st.session_state.progress_container.container():
+                st.subheader("Analysis Progress")
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+            process_tokens(analyzer, progress_bar, status_text)
 
         def stop_analysis():
             st.session_state.analysis['running'] = False
             clear_checkpoint()
-            st.session_state.progress_initialized = False
+            if st.session_state.progress_container:
+                st.session_state.progress_container.empty()
+                st.session_state.progress_container = None
 
         col1, col2 = st.columns(2)
         with col1:
@@ -319,50 +320,47 @@ def main():
         with col2:
             st.button("⏹ Stop Analysis", on_click=stop_analysis)
 
-    # Analysis progress handling
-    if st.session_state.analysis.get('running', False):
-        if not st.session_state.progress_initialized:
-            st.subheader("Analysis Progress")
-            st.session_state.progress_bar = st.progress(0)
-            st.session_state.status_text = st.empty()
-            st.session_state.progress_initialized = True
-
-        progress_bar = st.session_state.progress_bar
-        status_text = st.session_state.status_text
+    def process_tokens(analyzer, progress_bar, status_text):
+        params = st.session_state.analysis['params']
+        tokens = params['tokens'][st.session_state.analysis['processed']:]
         
+        def update_progress(processed, total, results, current_token):
+            progress = (st.session_state.analysis['processed'] + processed) / st.session_state.analysis['total']
+            progress_bar.progress(progress)
+            
+            status_text.markdown(f"""
+            **Progress:** {st.session_state.analysis['processed'] + processed}/{st.session_state.analysis['total']}  
+            **Valid Tokens:** {len(st.session_state.analysis['results']) + len(results)}  
+            **Current Token:** {current_token.get('symbol', 'Unknown')} 
+            ({current_token['address'][:6]}...)
+            """)
+            
+            st.session_state.analysis['results'].extend(results)
+            st.session_state.analysis['processed'] += processed
+            save_checkpoint(st.session_state.analysis)
+            
+            # Allow UI updates
+            time.sleep(0.01)
+
         try:
-            if st.session_state.analysis['generator']:
-                batch_result = next(st.session_state.analysis['generator'])
-                st.session_state.analysis['processed'] = batch_result['processed']
-                st.session_state.analysis['results'].extend(batch_result['results'])
-                
-                progress = st.session_state.analysis['processed'] / st.session_state.analysis['total']
-                progress_bar.progress(progress)
-                
-                status_text.markdown(f"""
-                **Progress:** {st.session_state.analysis['processed']}/{st.session_state.analysis['total']}  
-                **Valid Tokens:** {len(st.session_state.analysis['results'])}  
-                **Current Token:** {batch_result['current_token'].get('symbol', 'Unknown')} 
-                ({batch_result['current_token']['address'][:6]}...)
-                """)
-                
-                save_checkpoint(st.session_state.analysis)
-                time.sleep(0.05)  # Smooth out UI updates
-                st.rerun()
-                
-        except StopIteration:
-            st.session_state.analysis['running'] = False
+            batch_results = analyzer.analyze_batch(
+                tokens, 
+                params['min_mcap'],
+                progress_callback=update_progress
+            )
+            
+            st.session_state.analysis['results'].extend(batch_results)
             st.session_state.analysis_results = pd.DataFrame(st.session_state.analysis['results'])
-            clear_checkpoint()
-            st.session_state.progress_initialized = False
-            st.success("✅ Analysis completed!")
-            st.rerun()
+            
         except Exception as e:
             st.error(f"Analysis failed: {str(e)}")
+        finally:
             st.session_state.analysis['running'] = False
             clear_checkpoint()
-            st.session_state.progress_initialized = False
-            st.rerun()
+            if st.session_state.progress_container:
+                st.session_state.progress_container.empty()
+                st.session_state.progress_container = None
+            st.experimental_rerun()
 
     # Display results
     if not st.session_state.analysis.get('running', False) and not st.session_state.analysis_results.empty:
