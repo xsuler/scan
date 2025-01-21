@@ -192,18 +192,21 @@ class AnalysisManager:
         self.process_tokens(tokens)
 
     def create_ui(self):
+        # Create main container first
         st.session_state.ui['container'] = st.empty()
-        with st.session_state.ui['container']:
+        container = st.session_state.ui['container'].container()
+        
+        with container:
             st.subheader("Live Analysis Dashboard")
             cols = st.columns([3, 1])
-            self.progress_col = cols[0]
-            self.metrics_col = cols[1]
-
-            with self.progress_col:
+            
+            # Progress column
+            with cols[0]:
                 st.session_state.ui['progress'] = st.progress(0)
                 st.session_state.ui['status'] = st.empty()
-
-            with self.metrics_col:
+            
+            # Metrics column
+            with cols[1]:
                 st.session_state.ui['metrics'] = st.empty()
 
     def update_ui(self, token):
@@ -212,12 +215,14 @@ class AnalysisManager:
         elapsed = time.time() - metrics['start_time']
         speed = analysis['progress'] / elapsed if elapsed > 0 else 0
 
-        with st.session_state.ui['container']:
-            with self.progress_col:
+        container = st.session_state.ui['container'].container()
+        with container:
+            cols = st.columns([3, 1])
+            
+            with cols[0]:
                 st.session_state.ui['progress'].progress(
                     analysis['progress'] / metrics['total_tokens']
                 )
-                
                 status_text = f"""
                 **Current Token:** {token.get('symbol', 'Unknown')}  
                 **Address:** `{token['address'][:6]}...{token['address'][-4:]}`  
@@ -225,12 +230,12 @@ class AnalysisManager:
                 """
                 st.session_state.ui['status'].markdown(status_text)
             
-            with self.metrics_col:
+            with cols[1]:
                 metrics_text = f"""
-                ⚡ **Analysis Speed:** {speed:.1f} tokens/sec  
-                ⏱️ **Elapsed Time:** {elapsed:.1f}s  
-                ✅ **Valid Tokens:** {len(analysis['results'])}  
-                📈 **Current Price:** ${self.analyzer.get_token_price(token):.4f}
+                ⚡ **Speed:** {speed:.1f}/sec  
+                ⏱️ **Elapsed:** {elapsed:.1f}s  
+                ✅ **Valid:** {len(analysis['results'])}  
+                📈 **Price:** ${self.analyzer.get_token_price(token):.4f}
                 """
                 st.session_state.ui['metrics'].markdown(metrics_text)
 
