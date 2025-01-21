@@ -12,6 +12,7 @@ from urllib3.util.retry import Retry
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
 SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
 COINGECKO_API = "https://api.coingecko.com/api/v3"
+JUPITER_PRICE_API = "https://price.jup.ag/v4/price"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 UI_REFRESH_INTERVAL = 0.01
 
@@ -73,11 +74,14 @@ class TokenAnalyzer:
 
     def analyze_token(self, token):
         try:
+            price = self.get_token_price(token)
+            supply = self.get_circulating_supply(token)
+            
             analysis = {
                 'symbol': token.get('symbol', 'Unknown'),
                 'address': token['address'],
-                'price': self.get_token_price(token),
-                'market_cap': self.calculate_market_cap(token),
+                'price': price,
+                'market_cap': price * supply,
                 'liquidity': self.calculate_liquidity_score(token),
                 'rating': 0,
                 'volume': self.get_trading_volume(token),
@@ -90,13 +94,6 @@ class TokenAnalyzer:
         except Exception as e:
             st.error(f"Analysis failed for {token.get('symbol')}: {str(e)}")
             return None
-
-    def calculate_market_cap(self, token):
-        try:
-            supply = self.get_circulating_supply(token)
-            return float(supply * self.get_token_price(token))
-        except:
-            return 0.0
 
     def calculate_liquidity_score(self, token):
         try:
@@ -127,8 +124,29 @@ class TokenAnalyzer:
 
     def get_token_price(self, token):
         try:
-            return float(token.get('price', 0))
-        except:
+            # Try Jupiter's price API first
+            response = self.session.get(
+                f"{JUPITER_PRICE_API}?ids={token['address']}",
+                timeout=15
+            )
+            response.raise_for_status()
+            data = response.json()
+            price_data = data.get('data', {}).get(token['address'], {})
+            if price_data:
+                return float(price_data['price'])
+            
+            # Fallback to Coingecko if available
+            if 'coingeckoId' in token.get('extensions', {}):
+                response = self.session.get(
+                    f"{COINGECKO_API}/simple/price",
+                    params={'ids': token['extensions']['coingeckoId'], 'vs_currencies': 'usd'},
+                    timeout=15
+                )
+                return float(response.json()[token['extensions']['coingeckoId']]['usd'])
+            
+            return 0.0
+        except Exception as e:
+            print(f"Price error for {token['symbol']}: {str(e)}")
             return 0.0
 
     def get_holder_count(self, token):
@@ -139,15 +157,16 @@ class TokenAnalyzer:
 
     def get_trading_volume(self, token):
         try:
-            response = requests.get(
+            if 'coingeckoId' not in token.get('extensions', {}):
+                return 0.0
+                
+            response = self.session.get(
                 f"{COINGECKO_API}/coins/{token['extensions']['coingeckoId']}/market_chart",
                 params={'vs_currency': 'usd', 'days': '1'},
                 timeout=15
             )
             volumes = response.json().get('total_volumes', [])
-            if volumes:
-                return float(volumes[-1][1])
-            return 0.0
+            return float(volumes[-1][1]) if volumes else 0.0
         except Exception as e:
             print(f"Volume error: {str(e)}")
             return 0.0
