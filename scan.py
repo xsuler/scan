@@ -170,7 +170,8 @@ class AnalysisManager:
                 'progress': 0,
                 'results': [],
                 'params': None,
-                'metrics': {'start_time': None, 'speed': 0}
+                'metrics': {'start_time': None, 'speed': 0},
+                'current_index': 0
             }
         }
         for key, val in defaults.items():
@@ -186,29 +187,37 @@ class AnalysisManager:
                 'start_time': time.time(),
                 'speed': 0,
                 'total_tokens': len(tokens)
-            }
+            },
+            'current_index': 0,
+            'tokens': tokens
         }
-        self.process_tokens(tokens)
 
-    def process_tokens(self, tokens):
-        for idx, token in enumerate(tokens):
-            if not st.session_state.analysis['running']:
-                break
+    def process_tokens(self):
+        if not st.session_state.analysis['running']:
+            return
 
+        idx = st.session_state.analysis['current_index']
+        tokens = st.session_state.analysis['tokens']
+        
+        if idx < len(tokens):
+            token = tokens[idx]
             analysis = self.analyzer.analyze_token(token)
             if analysis and analysis['rating'] >= st.session_state.analysis['params']['min_rating']:
                 st.session_state.analysis['results'].append(analysis)
 
             st.session_state.analysis['progress'] = idx + 1
+            st.session_state.analysis['current_index'] += 1
+            st.session_state.analysis['metrics']['speed'] = (idx + 1) / (time.time() - st.session_state.analysis['metrics']['start_time'])
+            
+            # Schedule next iteration
             time.sleep(UI_REFRESH_INTERVAL)
             st.rerun()
-
-        self.finalize_analysis()
+        else:
+            self.finalize_analysis()
 
     def finalize_analysis(self):
         st.session_state.analysis['running'] = False
         st.session_state.results = pd.DataFrame(st.session_state.analysis['results'])
-        st.rerun()
 
 class UIManager:
     def __init__(self, analyzer):
@@ -284,6 +293,7 @@ class UIManager:
         tokens = self.analyzer.get_all_tokens(params['strict_mode'])
         if tokens:
             self.manager.start_analysis(tokens, params)
+            self.manager.process_tokens()
         else:
             st.error("No tokens found matching criteria")
 
@@ -293,6 +303,9 @@ class UIManager:
 
     def render_main(self):
         st.title("Real-time Solana Token Analysis")
+        
+        if st.session_state.analysis.get('running', False):
+            self.manager.process_tokens()
         
         if st.session_state.get('results') is not None:
             tab1, tab2 = st.tabs(["Analysis Results", "Market Overview"])
