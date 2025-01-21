@@ -47,7 +47,6 @@ class TokenAnalyzer:
         }
 
         try:
-            # Basic validation
             if not Pubkey.from_string(token.get('address', '')):
                 debug_entry['reasons'].append('Invalid address')
                 return False
@@ -58,7 +57,6 @@ class TokenAnalyzer:
                     debug_entry['reasons'].append(f'Missing {field}')
                     return False
 
-            # Advanced checks
             checks = [
                 ('tags', lambda: "community" in token.get('tags', [])),
                 ('coingecko', lambda: 'coingeckoId' in token.get('extensions', {})),
@@ -72,7 +70,6 @@ class TokenAnalyzer:
 
             debug_entry['valid'] = True
             return True
-
         except Exception as e:
             debug_entry['reasons'].append(f'Validation error: {str(e)}')
             return False
@@ -164,7 +161,7 @@ class AnalysisManager:
     def __init__(self, analyzer):
         self.analyzer = analyzer
         self.init_session()
-
+        
     def init_session(self):
         defaults = {
             'analysis': {
@@ -196,13 +193,17 @@ class AnalysisManager:
 
     def create_ui(self):
         st.session_state.ui['container'] = st.empty()
-        with st.session_state.ui['container'].container():
+        with st.session_state.ui['container']:
             st.subheader("Live Analysis Dashboard")
             cols = st.columns([3, 1])
-            with cols[0]:
+            self.progress_col = cols[0]
+            self.metrics_col = cols[1]
+
+            with self.progress_col:
                 st.session_state.ui['progress'] = st.progress(0)
                 st.session_state.ui['status'] = st.empty()
-            with cols[1]:
+
+            with self.metrics_col:
                 st.session_state.ui['metrics'] = st.empty()
 
     def update_ui(self, token):
@@ -211,28 +212,27 @@ class AnalysisManager:
         elapsed = time.time() - metrics['start_time']
         speed = analysis['progress'] / elapsed if elapsed > 0 else 0
 
-        with st.session_state.ui['container'].container():
-            # Progress Section
-            st.session_state.ui['progress'].progress(
-                analysis['progress'] / metrics['total_tokens']
-            )
+        with st.session_state.ui['container']:
+            with self.progress_col:
+                st.session_state.ui['progress'].progress(
+                    analysis['progress'] / metrics['total_tokens']
+                )
+                
+                status_text = f"""
+                **Current Token:** {token.get('symbol', 'Unknown')}  
+                **Address:** `{token['address'][:6]}...{token['address'][-4:]}`  
+                **Processed:** {analysis['progress']}/{metrics['total_tokens']}
+                """
+                st.session_state.ui['status'].markdown(status_text)
             
-            # Status Section
-            status_text = f"""
-            **Current Token:** {token.get('symbol', 'Unknown')}  
-            **Address:** `{token['address'][:6]}...{token['address'][-4:]}`  
-            **Processed:** {analysis['progress']}/{metrics['total_tokens']}
-            """
-            st.session_state.ui['status'].markdown(status_text)
-            
-            # Metrics Section
-            metrics_text = f"""
-            ⚡ **Analysis Speed:** {speed:.1f} tokens/sec  
-            ⏱️ **Elapsed Time:** {elapsed:.1f}s  
-            ✅ **Valid Tokens:** {len(analysis['results'])}  
-            📈 **Current Price:** ${self.analyzer.get_token_price(token):.4f}
-            """
-            st.session_state.ui['metrics'].markdown(metrics_text)
+            with self.metrics_col:
+                metrics_text = f"""
+                ⚡ **Analysis Speed:** {speed:.1f} tokens/sec  
+                ⏱️ **Elapsed Time:** {elapsed:.1f}s  
+                ✅ **Valid Tokens:** {len(analysis['results'])}  
+                📈 **Current Price:** ${self.analyzer.get_token_price(token):.4f}
+                """
+                st.session_state.ui['metrics'].markdown(metrics_text)
 
         time.sleep(UI_REFRESH_INTERVAL)
 
@@ -296,7 +296,7 @@ class UIManager:
                     self.stop_analysis()
 
             st.divider()
-            if st.button("🧹 Clear Cache", help="Reset all settings and data"):
+            if st.button("🧹 Clear Cache"):
                 clear_checkpoint()
                 st.session_state.clear()
                 st.rerun()
@@ -426,7 +426,6 @@ class UIManager:
                     height=300
                 )
 
-# Utility Functions
 def save_checkpoint():
     data = {
         'params': st.session_state.analysis['params'],
