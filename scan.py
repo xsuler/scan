@@ -4,21 +4,18 @@ import requests
 import time
 import plotly.express as px
 from solders.pubkey import Pubkey
-from solana.rpc.api import Client
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # Configuration
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
-SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
-COINGECKO_API = "https://api.coingecko.com/api/v3"
-JUPITER_PRICE_API = "https://price.jup.ag/v4/price"
+JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
+JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 UI_REFRESH_INTERVAL = 0.01
 
 class TokenAnalyzer:
     def __init__(self):
-        self.client = Client(SOLANA_RPC_ENDPOINT)
         self.session = requests.Session()
         retries = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])
         self.session.mount('https://', HTTPAdapter(max_retries=retries))
@@ -55,7 +52,6 @@ class TokenAnalyzer:
 
             checks = [
                 ('tags', lambda: "community" in token.get('tags', [])),
-                ('coingecko', lambda: 'coingeckoId' in token.get('extensions', {})),
                 ('chain', lambda: token.get('chainId') == 101)
             ]
 
@@ -74,21 +70,24 @@ class TokenAnalyzer:
 
     def analyze_token(self, token):
         try:
-            price = self.get_token_price(token)
-            supply = self.get_circulating_supply(token)
+            price_data = self.get_token_price_data(token)
             
             analysis = {
                 'symbol': token.get('symbol', 'Unknown'),
                 'address': token['address'],
-                'price': price,
-                'market_cap': price * supply,
+                'price': float(price_data.get('price', 0)),
+                'price_type': price_data.get('type', 'N/A'),
                 'liquidity': self.calculate_liquidity_score(token),
-                'rating': 0,
-                'volume': self.get_trading_volume(token),
-                'holders': self.get_holder_count(token),
+                'confidence': price_data.get('confidence', 'medium'),
+                'buy_price': float(price_data.get('buy_price', 0)),
+                'sell_price': float(price_data.get('sell_price', 0)),
+                'price_impact_10': float(price_data.get('price_impact_10', 0)),
+                'price_impact_100': float(price_data.get('price_impact_100', 0)),
+                'last_buy_price': float(price_data.get('last_buy_price', 0)),
+                'last_sell_price': float(price_data.get('last_sell_price', 0)),
                 'explorer': f"https://solscan.io/token/{token['address']}",
-                'age': self.get_token_age(token)
             }
+            
             analysis['rating'] = self.calculate_rating(analysis)
             return analysis
         except Exception as e:
@@ -100,7 +99,7 @@ class TokenAnalyzer:
             decimals = token.get('decimals', 9)
             amount = int(1000 * (10 ** decimals))
             quote = self.session.get(
-                f"https://quote-api.jup.ag/v6/quote?inputMint={token['address']}&outputMint={USDC_MINT}&amount={amount}",
+                f"{JUPITER_QUOTE_API}?inputMint={token['address']}&outputMint={USDC_MINT}&amount={amount}",
                 timeout=15
             ).json()
             return max(0.0, 100.0 - (float(quote.get('priceImpactPct', 1)) * 10000))
@@ -109,75 +108,47 @@ class TokenAnalyzer:
 
     def calculate_rating(self, analysis):
         try:
-            return min(100.0, (analysis['liquidity'] * 0.4) + 
-                      (analysis['market_cap'] / 1e6 * 0.3) + 
-                      (analysis['volume'] / 1e4 * 0.3))
+            liquidity_score = analysis['liquidity'] * 0.4
+            price_stability = (1 - abs(analysis['buy_price'] - analysis['sell_price'])/analysis['price']) * 0.3
+            market_depth = (1 - (analysis['price_impact_10'] + analysis['price_impact_100'])/2) * 0.3
+            
+            return min(100.0, (liquidity_score + price_stability + market_depth) * 100)
         except:
             return 0.0
 
-    def get_circulating_supply(self, token):
+    def get_token_price_data(self, token):
         try:
-            account = self.client.get_account_info_json_parsed(Pubkey.from_string(token['address'])).value
-            return float(account.data.parsed['info']['supply'] / 10 ** token.get('decimals', 9))
-        except:
-            return 0.0
-
-    def get_token_price(self, token):
-        try:
-            # Try Jupiter's price API first
             response = self.session.get(
-                f"{JUPITER_PRICE_API}?ids={token['address']}",
+                f"{JUPITER_PRICE_API}?ids={token['address']}&showExtraInfo=true",
                 timeout=15
             )
-            st.info(response.text)
-
             response.raise_for_status()
             data = response.json()
             price_data = data.get('data', {}).get(token['address'], {})
-            if price_data:
-                return float(price_data['price'])
+            extra_info = price_data.get('extraInfo', {})
             
-            # Fallback to Coingecko if available
-            if 'coingeckoId' in token.get('extensions', {}):
-                response = self.session.get(
-                    f"{COINGECKO_API}/simple/price",
-                    params={'ids': token['extensions']['coingeckoId'], 'vs_currencies': 'usd'},
-                    timeout=15
-                )
-                return float(response.json()[token['extensions']['coingeckoId']]['usd'])
-            
-            return 0.0
+            return {
+                'price': price_data.get('price', 0),
+                'type': price_data.get('type', 'N/A'),
+                'confidence': extra_info.get('confidenceLevel', 'medium'),
+                'buy_price': extra_info.get('quotedPrice', {}).get('buyPrice', 0),
+                'sell_price': extra_info.get('quotedPrice', {}).get('sellPrice', 0),
+                'price_impact_10': extra_info.get('depth', {})
+                                   .get('sellPriceImpactRatio', {})
+                                   .get('depth', {})
+                                   .get('10', 0),
+                'price_impact_100': extra_info.get('depth', {})
+                                    .get('sellPriceImpactRatio', {})
+                                    .get('depth', {})
+                                    .get('100', 0),
+                'last_buy_price': extra_info.get('lastSwappedPrice', {})
+                                   .get('lastJupiterBuyPrice', 0),
+                'last_sell_price': extra_info.get('lastSwappedPrice', {})
+                                    .get('lastJupiterSellPrice', 0)
+            }
         except Exception as e:
             print(f"Price error for {token['symbol']}: {str(e)}")
-            return 0.0
-
-    def get_holder_count(self, token):
-        try:
-            return int(self.client.get_token_supply(Pubkey.from_string(token['address'])).value.amount)
-        except:
-            return 0
-
-    def get_trading_volume(self, token):
-        try:
-            if 'coingeckoId' not in token.get('extensions', {}):
-                return 0.0
-                
-            response = self.session.get(
-                f"{COINGECKO_API}/coins/{token['extensions']['coingeckoId']}/market_chart",
-                params={'vs_currency': 'usd', 'days': '1'},
-                timeout=15
-            )
-            volumes = response.json().get('total_volumes', [])
-            return float(volumes[-1][1]) if volumes else 0.0
-        except Exception as e:
-            print(f"Volume error: {str(e)}")
-            return 0.0
-
-    def get_token_age(self, token):
-        try:
-            return float((time.time() - token.get('timestamp', time.time())) / 86400)
-        except:
-            return 0.0
+            return {}
 
 class AnalysisManager:
     def __init__(self, analyzer):
@@ -228,7 +199,6 @@ class AnalysisManager:
             token = tokens[idx]
             analysis = self.analyzer.analyze_token(token)
             
-            # Store current processing information
             st.session_state.analysis['current_token'] = token
             st.session_state.analysis['current_analysis'] = analysis
             
@@ -239,7 +209,6 @@ class AnalysisManager:
             st.session_state.analysis['current_index'] += 1
             st.session_state.analysis['metrics']['speed'] = (idx + 1) / (time.time() - st.session_state.analysis['metrics']['start_time'])
             
-            # Schedule next iteration
             time.sleep(UI_REFRESH_INTERVAL)
             st.rerun()
         else:
@@ -262,16 +231,9 @@ class UIManager:
             with st.expander("⚙️ Core Settings", expanded=True):
                 params = {
                     'min_rating': st.slider("Minimum Rating", 0, 100, 65),
-                    'min_mcap': st.number_input("Market Cap Floor (USD)", 1000, 10000000, 10000),
-                    'strict_mode': st.checkbox("Strict Validation", True)
+                    'strict_mode': st.checkbox("Strict Validation", True),
+                    'min_liquidity': st.slider("Min Liquidity Score", 0, 100, 50)
                 }
-
-            with st.expander("📊 Advanced Filters"):
-                params.update({
-                    'max_age': st.number_input("Max Token Age (days)", 1, 365, 30),
-                    'min_liquidity': st.slider("Min Liquidity Score", 0, 100, 50),
-                    'min_volume': st.number_input("Min Daily Volume (USD)", 0, 1000000, 1000)
-                })
 
             col1, col2 = st.columns(2)
             with col1:
@@ -316,20 +278,16 @@ class UIManager:
             shortened_address = f"{address[:6]}...{address[-4:]}" if address else ''
             st.caption(f"`{shortened_address}`")
             
-            price = current_analysis.get('price', 0.0) if current_analysis else 0.0
-            market_cap = current_analysis.get('market_cap', 0.0) if current_analysis else 0.0
-            rating = current_analysis.get('rating', 0.0) if current_analysis else 0.0
-            volume = current_analysis.get('volume', 0.0) if current_analysis else 0.0
-
-            st.markdown(f"""
-            Price: ${price}
-            
-            Market Cap: ${market_cap}  
-            
-            Rating: {rating:.1f}/100  
-            
-            Volume (24h): ${volume:,.0f}
-            """)
+            cols = st.columns(2)
+            with cols[0]:
+                st.metric("Current Price", f"${current_analysis.get('price', 0):.4f}")
+                st.metric("Buy Price", f"${current_analysis.get('buy_price', 0):.4f}")
+                st.metric("Price Impact (10)", f"{current_analysis.get('price_impact_10', 0)*100:.2f}%")
+                
+            with cols[1]:
+                st.metric("Confidence Level", current_analysis.get('confidence', 'N/A'))
+                st.metric("Sell Price", f"${current_analysis.get('sell_price', 0):.4f}")
+                st.metric("Price Impact (100)", f"{current_analysis.get('price_impact_100', 0)*100:.2f}%")
 
     def start_analysis(self, params):
         tokens = self.analyzer.get_all_tokens(params['strict_mode'])
@@ -344,19 +302,22 @@ class UIManager:
         st.rerun()
 
     def render_main(self):
-        st.title("Real-time Solana Token Analysis")
+        st.title("Advanced Solana Token Analyzer")
         
         if st.session_state.analysis.get('running', False):
             self.manager.process_tokens()
         
         if st.session_state.get('results') is not None:
-            tab1, tab2 = st.tabs(["Analysis Results", "Market Overview"])
+            tab1, tab2, tab3 = st.tabs(["Analysis Results", "Market Depth", "Price Dynamics"])
             
             with tab1:
                 self.render_results_table()
             
             with tab2:
-                self.render_market_charts()
+                self.render_market_depth_charts()
+            
+            with tab3:
+                self.render_price_analysis()
 
     def render_results_table(self):
         df = st.session_state.results.sort_values('rating', ascending=False)
@@ -365,30 +326,38 @@ class UIManager:
             column_config={
                 'symbol': 'Symbol',
                 'price': st.column_config.NumberColumn('Price', format="$%.4f"),
-                'market_cap': st.column_config.NumberColumn('Market Cap', format="$%.2f"),
                 'rating': st.column_config.ProgressColumn('Rating', format="%.1f"),
                 'liquidity': 'Liquidity Score',
-                'volume': st.column_config.NumberColumn('Volume', format="$%.0f"),
-                'age': 'Token Age'
+                'confidence': 'Confidence',
+                'buy_price': st.column_config.NumberColumn('Buy Price', format="$%.4f"),
+                'sell_price': st.column_config.NumberColumn('Sell Price', format="$%.4f"),
             },
             height=600,
             use_container_width=True
         )
 
-    def render_market_charts(self):
+    def render_market_depth_charts(self):
         df = st.session_state.results
         col1, col2 = st.columns(2)
         
         with col1:
-            fig = px.scatter(df, x='market_cap', y='rating', 
-                           hover_data=['symbol'], log_x=True,
-                           title="Market Cap vs Rating")
+            fig = px.scatter(df, x='price_impact_10', y='price_impact_100',
+                           color='confidence', hover_data=['symbol'],
+                           title="Price Impact Analysis")
             st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            fig = px.histogram(df, x='liquidity', nbins=20,
-                             title="Liquidity Distribution")
+            fig = px.density_heatmap(df, x='liquidity', y='rating',
+                                   marginal_x="histogram", marginal_y="histogram",
+                                   title="Liquidity vs Rating Distribution")
             st.plotly_chart(fig, use_container_width=True)
+
+    def render_price_analysis(self):
+        df = st.session_state.results
+        fig = px.scatter_3d(df, x='price', y='buy_price', z='sell_price',
+                          color='rating', hover_name='symbol',
+                          title="3D Price Relationship Analysis")
+        st.plotly_chart(fig, use_container_width=True)
 
 if __name__ == "__main__":
     analyzer = TokenAnalyzer()
