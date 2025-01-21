@@ -295,16 +295,13 @@ class UIManager:
         st.title("Real-time Solana Token Analysis")
         
         if st.session_state.get('results') is not None:
-            self.render_results()
-
-    def render_results(self):
-        tab1, tab2 = st.tabs(["Analysis Results", "Market Overview"])
-        
-        with tab1:
-            self.render_results_table()
-        
-        with tab2:
-            self.render_market_charts()
+            tab1, tab2 = st.tabs(["Analysis Results", "Market Overview"])
+            
+            with tab1:
+                self.render_results_table()
+            
+            with tab2:
+                self.render_market_charts()
 
     def render_results_table(self):
         df = st.session_state.results.sort_values('rating', ascending=False)
