@@ -306,12 +306,12 @@ def main():
                     'total': len(tokens)
                 }
             save_checkpoint(st.session_state.analysis)
-            st.rerun()
+            
 
         def stop_analysis():
             st.session_state.analysis['running'] = False
             clear_checkpoint()
-            st.rerun()
+            
 
         col1, col2 = st.columns(2)
         with col1:
