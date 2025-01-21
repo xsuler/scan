@@ -74,7 +74,7 @@ class TokenAnalyzer:
             price_data = self.get_token_price_data(token)
             if not price_data:
                 return None
-                
+            st.info(price_data)
             analysis = {
                 'symbol': token.get('symbol', 'Unknown'),
                 'address': token['address'],
