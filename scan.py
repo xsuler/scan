@@ -6,6 +6,8 @@ import time
 from datetime import datetime
 from solders.pubkey import Pubkey
 from solana.rpc.api import Client
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Configuration
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
@@ -15,22 +17,34 @@ RESULTS_FILE = "solana_contract_scan.csv"
 # Initialize Solana client
 solana_client = Client(SOLANA_RPC_ENDPOINT)
 
+# Configure requests session with retries
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
 # ======================
 # Blockchain Data Functions
 # ======================
 def fetch_token_list():
-    """Fetch complete token list from Jupiter Aggregator with validation"""
+    """Fetch token list with retries and validation"""
     try:
-        response = requests.get(JUPITER_TOKEN_LIST, timeout=10)
+        response = session.get(JUPITER_TOKEN_LIST, timeout=10)
         response.raise_for_status()
         tokens = response.json()
         return [t for t in tokens if _is_valid_spl_token(t.get('address'))]
     except Exception as e:
-        st.error(f"Token list fetch error: {str(e)}")
+        st.error(f"Token list error: {str(e)}")
         return []
 
 def _is_valid_spl_token(mint_address: str) -> bool:
-    """Validate if address is a proper SPL token using Solders"""
+    """Validate SPL token address"""
     try:
         if mint_address == "So11111111111111111111111111111111111111112":
             return False
@@ -39,12 +53,51 @@ def _is_valid_spl_token(mint_address: str) -> bool:
     except (ValueError, AttributeError):
         return False
 
+def get_token_price(mint_address: str) -> float:
+    """Get price with multiple fallback sources"""
+    try:
+        # Try Jupiter API
+        response = session.get(
+            f"https://price.jup.ag/v4/price?ids={mint_address}",
+            timeout=5
+        )
+        if response.status_code == 200:
+            price_data = response.json()
+            if price := price_data.get('data', {}).get(mint_address, {}).get('price'):
+                return float(price)
+
+        # Fallback to Raydium API
+        response = session.get(
+            f"https://api.raydium.io/v2/sdk/token/price?addresses[]={mint_address}",
+            timeout=5
+        )
+        if response.status_code == 200:
+            price_data = response.json()
+            if price := price_data.get('data', {}).get(mint_address, {}).get('price'):
+                return float(price)
+
+        # Final fallback to Birdeye (remove if not allowed)
+        response = session.get(
+            f"https://public-api.birdeye.so/public/price?address={mint_address}",
+            headers={"X-API-KEY": ""},
+            timeout=5
+        )
+        if response.status_code == 200:
+            price_data = response.json()
+            if price := price_data.get('data', {}).get('value'):
+                return float(price)
+
+        return 0.0
+    except Exception as e:
+        st.error(f"Price error for {mint_address}: {str(e)}")
+        return 0.0
+
 def get_token_details(mint_address: str):
-    """Get on-chain token details with proper Pubkey handling"""
+    """Get on-chain token details with enhanced validation"""
     try:
         pubkey = Pubkey.from_string(mint_address)
         
-        # Get token supply with commitment level
+        # Get token supply
         supply_info = solana_client.get_token_supply(pubkey, commitment="confirmed")
         if not supply_info.value:
             return None
@@ -58,34 +111,26 @@ def get_token_details(mint_address: str):
         timestamp = int.from_bytes(decoded[:4], byteorder='big') / 1000
         age_days = (datetime.now() - datetime.fromtimestamp(timestamp)).days
 
-        # Get price from Jupiter price API
-        price_response = requests.get(
-            f"https://price.jup.ag/v4/price?ids={mint_address}",
-            timeout=5
-        )
-        if price_response.status_code != 200:
-            return None
-            
-        price_data = price_response.json()
-        price = price_data.get('data', {}).get(mint_address, {}).get('price', 0)
+        # Get price
+        price = get_token_price(mint_address)
 
         return {
             'supply': supply,
             'decimals': decimals,
             'age_days': age_days,
-            'price': float(price),
-            'market_cap': float(price) * supply,
+            'price': price,
+            'market_cap': price * supply,
             'timestamp': datetime.now().isoformat()
         }
     except Exception as e:
-        st.error(f"Detail fetch error for {mint_address}: {str(e)}")
+        st.error(f"Detail error for {mint_address}: {str(e)}")
         return None
 
 # ======================
 # Data Processing
 # ======================
 def process_token_entry(token):
-    """Process raw token data with enhanced validation"""
+    """Process token data with validation"""
     if not _is_valid_spl_token(token.get('address')):
         return None
 
@@ -109,7 +154,7 @@ def process_token_entry(token):
     }
 
 def calculate_liquidity_score(token, details):
-    """Calculate composite liquidity score with market cap weighting"""
+    """Calculate composite liquidity score"""
     score = 0
     score += min(50, details['market_cap'] / 1e6 * 0.5) if details['market_cap'] else 0
     score += 30 if token.get('extensions', {}).get('verified') else 0
@@ -124,7 +169,7 @@ class BlockchainAnalyzer:
         self.params = params
 
     def analyze_token(self, token):
-        """Apply analysis filters with type checking"""
+        """Apply analysis filters"""
         if not token or not isinstance(token, dict):
             return None
 
@@ -145,7 +190,7 @@ class BlockchainAnalyzer:
 # UI & Data Management
 # ======================
 def initialize_session():
-    """Initialize Streamlit session state with validation"""
+    """Initialize Streamlit session state"""
     default_columns = [
         'timestamp', 'symbol', 'contract_address', 'price',
         'market_cap', 'liquidity_score', 'verified', 'age_days'
@@ -170,16 +215,16 @@ def initialize_session():
             st.session_state.results = pd.DataFrame(columns=default_columns)
 
 def save_results():
-    """Persist results to CSV with validation"""
+    """Persist results to CSV"""
     try:
         st.session_state.results.to_csv(RESULTS_FILE, index=False)
     except Exception as e:
-        st.error(f"Failed to save results: {str(e)}")
+        st.error(f"Save error: {str(e)}")
 
 def display_results():
-    """Render results in formatted dataframe with error handling"""
+    """Render results table"""
     if st.session_state.results.empty:
-        st.info("No scan results available. Run a scan first.")
+        st.info("No results found. Run a scan first.")
         return
 
     try:
@@ -211,7 +256,7 @@ def display_results():
             hide_index=True
         )
     except Exception as e:
-        st.error(f"Error displaying results: {str(e)}")
+        st.error(f"Display error: {str(e)}")
 
 # ======================
 # Streamlit UI
@@ -222,25 +267,25 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    st.title("🔭 Solana SPL Token Analyzer")
+    st.title("🔭 Solana SPL Token Scanner")
 
     initialize_session()
 
     # Sidebar Controls
     with st.sidebar:
-        st.header("Analysis Parameters")
+        st.header("Scan Parameters")
         
         col1, col2 = st.columns(2)
         with col1:
             st.session_state.params['min_mcap'] = st.number_input(
-                "Minimum Market Cap (USD)",
+                "Min Market Cap (USD)",
                 min_value=0.0,
                 value=1e4,
                 step=1e3,
                 format="%.0f"
             )
             st.session_state.params['min_price'] = st.number_input(
-                "Minimum Price (USD)",
+                "Min Price (USD)",
                 min_value=0.0,
                 value=0.001,
                 step=0.001,
@@ -249,36 +294,36 @@ def main():
             
         with col2:
             st.session_state.params['min_liquidity'] = st.slider(
-                "Liquidity Score Threshold",
+                "Liquidity Score",
                 min_value=0,
                 max_value=100,
                 value=50
             )
             st.session_state.params['min_age'] = st.slider(
-                "Minimum Contract Age (Days)",
+                "Min Age (Days)",
                 min_value=0,
                 max_value=365,
                 value=7
             )
         
         st.session_state.params['verified_only'] = st.checkbox(
-            "Verified Contracts Only",
+            "Verified Only",
             value=False
         )
 
-        if st.button("🔍 Start Blockchain Scan", type="primary"):
-            with st.spinner("Scanning Solana blockchain..."):
+        if st.button("🔍 Start Scan", type="primary"):
+            with st.spinner("Scanning blockchain..."):
                 start_time = time.time()
                 try:
                     tokens = fetch_token_list()
                     analyzer = BlockchainAnalyzer(st.session_state.params)
                     
                     new_results = []
-                    for token in tokens[:100]:  # Limit to first 100 for performance
+                    for token in tokens[:100]:  # Process first 100 tokens
                         processed = process_token_entry(token)
                         if result := analyzer.analyze_token(processed):
                             new_results.append(result)
-                        time.sleep(0.2)  # Conservative rate limiting
+                        time.sleep(0.25)  # Rate limiting
 
                     if new_results:
                         new_df = pd.DataFrame(new_results)
@@ -287,11 +332,11 @@ def main():
                             ignore_index=True
                         ).drop_duplicates(['contract_address'], keep='last')
                         save_results()
-                        st.success(f"Found {len(new_results)} qualifying contracts!")
+                        st.success(f"Found {len(new_results)} contracts!")
                     else:
-                        st.warning("No matching contracts found")
+                        st.warning("No matches found")
                     
-                    st.write(f"Scan duration: {time.time() - start_time:.2f} seconds")
+                    st.write(f"Scan took {time.time() - start_time:.2f}s")
                 except Exception as e:
                     st.error(f"Scan failed: {str(e)}")
 
@@ -302,13 +347,13 @@ def main():
             mime="text/csv"
         )
 
-        if st.button("🔄 Reset Results"):
+        if st.button("🔄 Reset Data"):
             st.session_state.results = pd.DataFrame(columns=[
                 'timestamp', 'symbol', 'contract_address', 'price',
                 'market_cap', 'liquidity_score', 'verified', 'age_days'
             ])
             save_results()
-            st.success("Results cleared successfully")
+            st.success("Data cleared")
 
     # Main Display
     col1, col2, col3 = st.columns(3)
@@ -317,7 +362,7 @@ def main():
     with col2:
         avg_score = st.session_state.results['liquidity_score'].mean() \
             if not st.session_state.results.empty else 0
-        st.metric("Average Liquidity Score", f"{avg_score:.1f}/100")
+        st.metric("Avg Liquidity", f"{avg_score:.1f}/100")
     with col3:
         new_today = len(st.session_state.results[
             pd.to_datetime(st.session_state.results['timestamp']).dt.date == datetime.today().date()
