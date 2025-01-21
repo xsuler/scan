@@ -1,331 +1,297 @@
 import streamlit as st
 import pandas as pd
 import requests
-from datetime import datetime, timedelta
+import base58
 import time
+from datetime import datetime
+from solana.rpc.api import Client
 
 # Configuration
-SOLSCAN_API = "https://api.solscan.io/tokens"
-SOLANA_TOKEN_API = "https://api.solscan.io/chain/wallet/tokens"
-RESULTS_FILE = "solana_scan_results.csv"
+JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
+SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
+RESULTS_FILE = "solana_contract_scan.csv"
+
+# Initialize Solana client
+solana_client = Client(SOLANA_RPC_ENDPOINT)
 
 # ======================
-# Data Fetching & Processing
+# Blockchain Data Functions
 # ======================
-def fetch_assets():
-    """Fetch top Solana tokens from Solscan API with retry logic"""
+def fetch_token_list():
+    """Fetch complete token list from Jupiter Aggregator"""
     try:
-        response = requests.get(SOLSCAN_API, params={
-            'sort': 'volume24h',
-            'direction': 'desc',
-            'limit': 100,
-            'offset': 0
-        })
+        response = requests.get(JUPITER_TOKEN_LIST, timeout=10)
         response.raise_for_status()
-        data = response.json().get('data', {}).get('tokens', [])
-        
-        # Additional metadata fetch for contract details
-        enhanced_data = []
-        for token in data[:50]:  # Limit to top 50 for performance
-            try:
-                detail_response = requests.get(f"https://api.solscan.io/token/meta?token={token['mint']}")
-                if detail_response.status_code == 200:
-                    token.update(detail_response.json().get('data', {}))
-                enhanced_data.append(token)
-                time.sleep(0.1)  # Rate limiting
-            except Exception as e:
-                st.error(f"Error fetching details for {token['mint']}: {str(e)}")
-        return enhanced_data
+        return response.json()
     except Exception as e:
-        st.error(f"API Error: {str(e)}")
+        st.error(f"Token list fetch error: {str(e)}")
         return []
 
-def process_asset(asset):
-    """Convert Solscan API response to cleaned data with enhanced fields"""
+def get_token_details(mint_address):
+    """Get on-chain token details including supply and metadata"""
     try:
-        price = float(asset.get('price', 0))
-        market_cap = float(asset.get('marketCap', 0))
-        supply = market_cap / price if price != 0 else 0
-        
+        # Get token supply
+        supply_info = solana_client.get_token_supply(mint_address).value
+        decimals = supply_info.decimals if supply_info else 9
+        raw_supply = int(supply_info.amount) if supply_info else 0
+        supply = raw_supply / (10 ** decimals)
+
+        # Get mint timestamp from address
+        decoded = base58.b58decode(mint_address)
+        timestamp = int.from_bytes(decoded[:4], byteorder='big') / 1000
+        age_days = (datetime.now() - datetime.fromtimestamp(timestamp)).days
+
+        # Get price from Jupiter price API
+        price_response = requests.get(
+            f"https://price.jup.ag/v4/price?ids={mint_address}",
+            timeout=5
+        )
+        price_data = price_response.json() if price_response.status_code == 200 else {}
+        price = price_data.get('data', {}).get(mint_address, {}).get('price', 0)
+
         return {
-            'symbol': asset.get('symbol', '').upper(),
-            'name': asset.get('name', 'Unknown'),
-            'price': price,
-            'market_cap': market_cap,
-            'volume_24h': float(asset.get('volume24h', 0)),
             'supply': supply,
-            'timestamp': datetime.now().isoformat(),
-            'contract_address': asset.get('mint', ''),
-            'decimals': asset.get('decimals', 9),
-            'holder_count': asset.get('holderCount', 0),
-            'website': asset.get('website', ''),
-            'twitter': asset.get('twitter', ''),
-            'explorer': f"https://solscan.io/token/{asset.get('mint', '')}",
-            'created_at': asset.get('createdTime', ''),
-            'tag': asset.get('tag', ''),
-            'verified': asset.get('verified', False)
+            'decimals': decimals,
+            'age_days': age_days,
+            'price': float(price),
+            'market_cap': float(price) * supply,
+            'timestamp': datetime.now().isoformat()
         }
     except Exception as e:
-        st.error(f"Processing error: {str(e)}")
+        st.error(f"Detail fetch error for {mint_address}: {str(e)}")
         return None
 
 # ======================
-# Advanced Analysis Engine
+# Data Processing
 # ======================
-class ContractAnalyzer:
+def process_token_entry(token):
+    """Process raw token data into structured format"""
+    details = get_token_details(token['address'])
+    if not details:
+        return None
+
+    return {
+        'symbol': token['symbol'].upper(),
+        'name': token['name'],
+        'contract_address': token['address'],
+        'price': details['price'],
+        'market_cap': details['market_cap'],
+        'supply': details['supply'],
+        'age_days': details['age_days'],
+        'decimals': details['decimals'],
+        'verified': token.get('extensions', {}).get('verified', False),
+        'liquidity_score': calculate_liquidity_score(token, details),
+        'explorer': f"https://solscan.io/token/{token['address']}",
+        **details
+    }
+
+def calculate_liquidity_score(token, details):
+    """Calculate composite liquidity score"""
+    score = 0
+    # Market cap component (0-50)
+    score += min(50, details['market_cap'] / 1e6 * 0.5)
+    # Verification bonus
+    score += 30 if token.get('extensions', {}).get('verified') else 0
+    # Age component
+    score += min(20, details['age_days'] * 0.2)
+    return round(score, 1)
+
+# ======================
+# Analysis Engine
+# ======================
+class BlockchainAnalyzer:
     def __init__(self, params):
         self.params = params
-        self.risk_metrics = ['holder_count', 'verified', 'volume_24h']
-        
-    def analyze(self, asset):
-        """Comprehensive analysis of Solana contract"""
-        if not asset:
-            return None
-            
-        analysis = {
-            'symbol': asset['symbol'],
-            'price': asset['price'],
-            'market_cap': asset['market_cap'],
-            'volume_24h': asset['volume_24h'],
-            'volume_mcap_ratio': self.calculate_volume_mcap_ratio(asset),
-            'liquidity_score': self.calculate_liquidity_score(asset),
-            'risk_score': self.calculate_risk_score(asset),
-            'timestamp': asset['timestamp'],
-            'contract_address': asset['contract_address'],
-            'explorer': asset['explorer'],
-            'holders': asset['holder_count'],
-            'verified': asset['verified'],
-            'age_days': self.calculate_age_days(asset)
-        }
-        
-        if self.passes_filters(analysis):
-            return analysis
-        return None
-
-    def calculate_volume_mcap_ratio(self, asset):
-        try:
-            return (asset['volume_24h'] / asset['market_cap']) * 100 if asset['market_cap'] > 0 else 0
-        except:
-            return 0
-
-    def calculate_liquidity_score(self, asset):
-        try:
-            return (asset['volume_24h'] * 0.6 + 
-                    asset['market_cap'] * 0.3 +
-                    asset['holder_count'] * 0.1)
-        except:
-            return 0
-
-    def calculate_risk_score(self, asset):
-        risk = 0
-        if asset['holder_count'] < 100: risk += 30
-        if not asset['verified']: risk += 50
-        if asset['age_days'] < 7: risk += 20
-        return min(100, risk)
-
-    def calculate_age_days(self, asset):
-        try:
-            created_date = datetime.fromtimestamp(asset['created_at']/1000)
-            return (datetime.now() - created_date).days
-        except:
-            return 0
-
-    def passes_filters(self, analysis):
-        checks = [
-            analysis['market_cap'] >= self.params['min_mcap'],
-            analysis['volume_24h'] >= self.params['min_volume'],
-            analysis['price'] >= self.params['min_price'],
-            analysis['volume_mcap_ratio'] >= self.params['min_volume_ratio'],
-            analysis['liquidity_score'] >= self.params['min_liquidity_score'],
-            analysis['risk_score'] <= self.params['max_risk_score'],
-            analysis['holders'] >= self.params['min_holders'],
-            analysis['age_days'] >= self.params['min_age_days']
+        self.required_fields = [
+            'symbol', 'contract_address', 'price', 
+            'market_cap', 'liquidity_score', 'verified'
         ]
-        return all(checks)
+
+    def analyze_token(self, token):
+        """Apply analysis filters to token data"""
+        if not token or token['price'] <= 0:
+            return None
+
+        checks = [
+            token['market_cap'] >= self.params['min_mcap'],
+            token['price'] >= self.params['min_price'],
+            token['liquidity_score'] >= self.params['min_liquidity'],
+            token['verified'] or not self.params['verified_only'],
+            token['age_days'] >= self.params['min_age']
+        ]
+
+        return token if all(checks) else None
 
 # ======================
-# Data Management
+# UI & Data Management
 # ======================
-def load_results():
-    """Load results with data validation"""
-    required_cols = [
-        'timestamp', 'symbol', 'price', 'market_cap', 'volume_24h',
-        'volume_mcap_ratio', 'liquidity_score', 'risk_score',
-        'contract_address', 'explorer', 'holders', 'verified', 'age_days'
-    ]
+def initialize_session():
+    """Initialize Streamlit session state"""
+    if 'params' not in st.session_state:
+        st.session_state.params = {
+            'min_mcap': 1e4,
+            'min_price': 0.001,
+            'min_liquidity': 50,
+            'verified_only': False,
+            'min_age': 7
+        }
     
-    try:
-        df = pd.read_csv(RESULTS_FILE)
-        for col in required_cols:
-            if col not in df.columns:
-                df[col] = None
-        return df
-    except (FileNotFoundError, pd.errors.EmptyDataError):
-        return pd.DataFrame(columns=required_cols)
+    if 'results' not in st.session_state:
+        try:
+            st.session_state.results = pd.read_csv(RESULTS_FILE)
+        except:
+            st.session_state.results = pd.DataFrame(columns=[
+                'timestamp', 'symbol', 'contract_address', 'price',
+                'market_cap', 'liquidity_score', 'verified', 'age_days'
+            ])
 
-def save_results(df):
-    """Save results with data validation"""
-    required_cols = [
-        'timestamp', 'symbol', 'price', 'market_cap', 'volume_24h',
-        'volume_mcap_ratio', 'liquidity_score', 'risk_score',
-        'contract_address', 'explorer', 'holders', 'verified', 'age_days'
-    ]
+def save_results():
+    """Persist results to CSV"""
+    st.session_state.results.to_csv(RESULTS_FILE, index=False)
+
+def display_results():
+    """Render results in formatted dataframe"""
+    if st.session_state.results.empty:
+        st.info("No scan results available. Run a scan first.")
+        return
+
+    df = st.session_state.results.copy()
+    df['price'] = df['price'].apply(
+        lambda x: f"${x:.4f}" if x >= 0.0001 else f"${x:.8f}")
+    df['market_cap'] = df['market_cap'].apply(
+        lambda x: f"${x/1e3:,.1f}K" if x < 1e6 else f"${x/1e6:.2f}M")
     
-    safe_df = pd.DataFrame(columns=required_cols)
-    for col in required_cols:
-        if col in df.columns:
-            safe_df[col] = df[col]
-        else:
-            safe_df[col] = None
-            
-    safe_df.to_csv(RESULTS_FILE, index=False)
+    st.dataframe(
+        df.sort_values('market_cap', ascending=False),
+        column_config={
+            'symbol': 'Symbol',
+            'price': 'Price',
+            'market_cap': 'Market Cap',
+            'liquidity_score': st.column_config.ProgressColumn(
+                'Liquidity',
+                format="%.1f",
+                min_value=0,
+                max_value=100
+            ),
+            'contract_address': 'Contract Address',
+            'verified': 'Verified',
+            'age_days': 'Age (Days)',
+            'explorer': st.column_config.LinkColumn('Block Explorer')
+        },
+        height=700,
+        use_container_width=True,
+        hide_index=True
+    )
 
 # ======================
 # Streamlit UI
 # ======================
 def main():
-    st.set_page_config(page_title="Solana Contract Scanner PRO", layout="wide")
-    st.title("🔍 Advanced Solana Contract Scanner")
-    
-    # Initialize session state
-    if 'params' not in st.session_state:
-        st.session_state.params = {
-            'min_mcap': 1e5,
-            'min_volume': 5e4,
-            'min_price': 0.001,
-            'min_volume_ratio': 0.5,
-            'min_liquidity_score': 25.0,
-            'max_risk_score': 70,
-            'min_holders': 100,
-            'min_age_days': 3,
-            'excluded_assets': ['USDT', 'USDC', 'BUSD']
-        }
-    
-    if 'results' not in st.session_state:
-        st.session_state.results = load_results()
+    st.set_page_config(
+        page_title="Solana Contract Scanner",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    st.title("🔭 Solana Smart Contract Analyzer")
+
+    initialize_session()
 
     # Sidebar Controls
     with st.sidebar:
-        st.header("Scan Parameters")
+        st.header("Analysis Parameters")
         
         col1, col2 = st.columns(2)
         with col1:
             st.session_state.params['min_mcap'] = st.number_input(
-                "Min Market Cap (USD)", 1e3, 1e9, 1e5, format="%.0f")
-            st.session_state.params['min_volume'] = st.number_input(
-                "Min 24h Volume (USD)", 1e3, 1e9, 5e4, format="%.0f")
+                "Minimum Market Cap (USD)",
+                min_value=0.0,
+                value=1e4,
+                step=1e3,
+                format="%.0f"
+            )
             st.session_state.params['min_price'] = st.number_input(
-                "Min Price (USD)", 0.0001, 1000.0, 0.001, format="%.4f")
+                "Minimum Price (USD)",
+                min_value=0.0,
+                value=0.001,
+                step=0.001,
+                format="%.4f"
+            )
             
         with col2:
-            st.session_state.params['min_holders'] = st.number_input(
-                "Min Holders", 1, 100000, 100)
-            st.session_state.params['min_age_days'] = st.number_input(
-                "Min Age (Days)", 0, 365, 3)
-            st.session_state.params['max_risk_score'] = st.slider(
-                "Max Risk Score", 0, 100, 70)
+            st.session_state.params['min_liquidity'] = st.slider(
+                "Liquidity Score Threshold",
+                min_value=0,
+                max_value=100,
+                value=50
+            )
+            st.session_state.params['min_age'] = st.slider(
+                "Minimum Contract Age (Days)",
+                min_value=0,
+                max_value=365,
+                value=7
+            )
         
-        st.session_state.params['min_volume_ratio'] = st.slider(
-            "Volume/MCap Ratio (%)", 0.0, 20.0, 0.5, 0.1)
-        st.session_state.params['min_liquidity_score'] = st.slider(
-            "Liquidity Score Threshold", 0.0, 1000.0, 25.0, 1.0)
+        st.session_state.params['verified_only'] = st.checkbox(
+            "Verified Contracts Only",
+            value=False
+        )
 
-        if st.button("🚀 Start Scan", type="primary"):
-            with st.spinner("Scanning Solana contracts..."):
+        if st.button("🔍 Start Blockchain Scan", type="primary"):
+            with st.spinner("Scanning Solana blockchain..."):
                 start_time = time.time()
-                raw_assets = fetch_assets()
-                processed_assets = [process_asset(a) for a in raw_assets]
-                filtered_assets = [
-                    a for a in processed_assets 
-                    if a and a['symbol'] not in st.session_state.params['excluded_assets']
-                ]
+                tokens = fetch_token_list()
+                analyzer = BlockchainAnalyzer(st.session_state.params)
                 
-                analyzer = ContractAnalyzer(st.session_state.params)
                 new_results = []
-                
-                for asset in filtered_assets:
-                    result = analyzer.analyze(asset)
-                    if result:
+                for token in tokens[:100]:  # Limit to first 100 for performance
+                    processed = process_token_entry(token)
+                    if result := analyzer.analyze_token(processed):
                         new_results.append(result)
-                
+                    time.sleep(0.1)  # Rate limiting
+
                 if new_results:
                     new_df = pd.DataFrame(new_results)
                     st.session_state.results = pd.concat(
-                        [st.session_state.results, new_df], 
+                        [st.session_state.results, new_df],
                         ignore_index=True
-                    )
-                    save_results(st.session_state.results)
+                    ).drop_duplicates(['contract_address'], keep='last')
+                    save_results()
                     st.success(f"Found {len(new_results)} qualifying contracts!")
                 else:
-                    st.warning("No contracts matching current criteria")
+                    st.warning("No matching contracts found")
                 
-                st.write(f"Scan completed in {time.time() - start_time:.2f}s")
+                st.write(f"Scan duration: {time.time() - start_time:.2f} seconds")
 
         st.download_button(
-            "💾 Export Data",
+            "📥 Download Results",
             data=st.session_state.results.to_csv(index=False),
             file_name="solana_contracts.csv",
             mime="text/csv"
         )
 
         if st.button("🔄 Reset Results"):
-            st.session_state.results = pd.DataFrame(columns=load_results().columns)
-            save_results(st.session_state.results)
-            st.success("Results cleared")
+            st.session_state.results = pd.DataFrame(columns=[
+                'timestamp', 'symbol', 'contract_address', 'price',
+                'market_cap', 'liquidity_score', 'verified', 'age_days'
+            ])
+            save_results()
+            st.success("Results cleared successfully")
 
     # Main Display
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Total Contracts", len(st.session_state.results))
     with col2:
-        avg_risk = st.session_state.results['risk_score'].mean() if not st.session_state.results.empty else 0
-        st.metric("Average Risk Score", f"{avg_risk:.1f}/100")
+        avg_score = st.session_state.results['liquidity_score'].mean() \
+            if not st.session_state.results.empty else 0
+        st.metric("Average Liquidity Score", f"{avg_score:.1f}/100")
     with col3:
-        new_today = len(st.session_state.results[pd.to_datetime(st.session_state.results['timestamp']).dt.date == datetime.today().date()])
+        new_today = len(st.session_state.results[
+            pd.to_datetime(st.session_state.results['timestamp']).dt.date == datetime.today().date()
+        ]) if not st.session_state.results.empty else 0
         st.metric("New Today", new_today)
 
-    # Results Display
-    if not st.session_state.results.empty:
-        df = st.session_state.results.copy()
-        
-        # Formatting
-        df['price'] = df['price'].apply(lambda x: f"${x:.4f}" if x > 0.0001 else f"${x:.8f}")
-        df['market_cap'] = df['market_cap'].apply(lambda x: f"${x/1e6:.2f}M" if x >= 1e6 else f"${x:.2f}")
-        df['volume_24h'] = df['volume_24h'].apply(lambda x: f"${x/1e3:,.1f}K" if x < 1e6 else f"${x/1e6:.2f}M")
-        df['volume_mcap_ratio'] = df['volume_mcap_ratio'].apply(lambda x: f"{x:.2f}%")
-        df['liquidity_score'] = df['liquidity_score'].apply(lambda x: f"{x:.1f}")
-        df['risk_score'] = df['risk_score'].apply(lambda x: f"{x:.0f} ⭐" if x < 30 else f"{x:.0f} ⚠️" if x < 70 else f"{x:.0f} 🔥")
-
-        st.dataframe(
-            df.sort_values('timestamp', ascending=False),
-            column_config={
-                'symbol': 'Symbol',
-                'price': 'Price',
-                'market_cap': 'Market Cap',
-                'volume_24h': '24h Volume',
-                'volume_mcap_ratio': 'Vol/MCap',
-                'liquidity_score': 'Liquidity',
-                'risk_score': 'Risk',
-                'explorer': st.column_config.LinkColumn(
-                    "Contract",
-                    help="View on Solscan",
-                    display_text="🔗 View"
-                ),
-                'holders': 'Holders',
-                'verified': 'Verified',
-                'age_days': 'Age (Days)'
-            },
-            column_order=[
-                'symbol', 'price', 'market_cap', 'volume_24h',
-                'volume_mcap_ratio', 'liquidity_score', 'risk_score',
-                'holders', 'verified', 'age_days', 'explorer'
-            ],
-            height=700,
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info("Run a scan to discover Solana contracts")
+    display_results()
 
 if __name__ == "__main__":
     main()
