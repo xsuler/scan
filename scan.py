@@ -6,36 +6,23 @@ import time
 from datetime import datetime
 from solders.pubkey import Pubkey
 from solana.rpc.api import Client
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # Configuration
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
+JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
 RESULTS_FILE = "solana_contract_scan.csv"
 
 # Initialize Solana client
 solana_client = Client(SOLANA_RPC_ENDPOINT)
 
-# Configure requests session with retries
-session = requests.Session()
-retry_strategy = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"]
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
-
 # ======================
 # Blockchain Data Functions
 # ======================
 def fetch_token_list():
-    """Fetch token list with retries and validation"""
+    """Fetch tokens from Jupiter Aggregator with validation"""
     try:
-        response = session.get(JUPITER_TOKEN_LIST, timeout=10)
+        response = requests.get(JUPITER_TOKEN_LIST, timeout=10)
         response.raise_for_status()
         tokens = response.json()
         return [t for t in tokens if _is_valid_spl_token(t.get('address'))]
@@ -54,51 +41,27 @@ def _is_valid_spl_token(mint_address: str) -> bool:
         return False
 
 def get_token_price(mint_address: str) -> float:
-    """Get price with multiple fallback sources"""
+    """Get price using Jupiter v2 API"""
     try:
-        # Try Jupiter API
-        response = session.get(
-            f"https://price.jup.ag/v4/price?ids={mint_address}",
+        response = requests.get(
+            f"{JUPITER_PRICE_API}?ids={mint_address}",
             timeout=5
         )
         if response.status_code == 200:
             price_data = response.json()
-            if price := price_data.get('data', {}).get(mint_address, {}).get('price'):
-                return float(price)
-
-        # Fallback to Raydium API
-        response = session.get(
-            f"https://api.raydium.io/v2/sdk/token/price?addresses[]={mint_address}",
-            timeout=5
-        )
-        if response.status_code == 200:
-            price_data = response.json()
-            if price := price_data.get('data', {}).get(mint_address, {}).get('price'):
-                return float(price)
-
-        # Final fallback to Birdeye (remove if not allowed)
-        response = session.get(
-            f"https://public-api.birdeye.so/public/price?address={mint_address}",
-            headers={"X-API-KEY": ""},
-            timeout=5
-        )
-        if response.status_code == 200:
-            price_data = response.json()
-            if price := price_data.get('data', {}).get('value'):
-                return float(price)
-
+            return float(price_data['data'][mint_address]['price'])
         return 0.0
     except Exception as e:
         st.error(f"Price error for {mint_address}: {str(e)}")
         return 0.0
 
 def get_token_details(mint_address: str):
-    """Get on-chain token details with enhanced validation"""
+    """Get on-chain token details"""
     try:
         pubkey = Pubkey.from_string(mint_address)
         
         # Get token supply
-        supply_info = solana_client.get_token_supply(pubkey, commitment="confirmed")
+        supply_info = solana_client.get_token_supply(pubkey)
         if not supply_info.value:
             return None
             
@@ -106,20 +69,20 @@ def get_token_details(mint_address: str):
         raw_supply = int(supply_info.value.amount)
         supply = raw_supply / (10 ** decimals)
 
-        # Get mint timestamp from address bytes
+        # Get price
+        price = get_token_price(mint_address)
+
+        # Get approximate age from mint address
         decoded = bytes(pubkey)
         timestamp = int.from_bytes(decoded[:4], byteorder='big') / 1000
         age_days = (datetime.now() - datetime.fromtimestamp(timestamp)).days
 
-        # Get price
-        price = get_token_price(mint_address)
-
         return {
             'supply': supply,
             'decimals': decimals,
-            'age_days': age_days,
             'price': price,
             'market_cap': price * supply,
+            'age_days': age_days,
             'timestamp': datetime.now().isoformat()
         }
     except Exception as e:
