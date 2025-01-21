@@ -275,11 +275,6 @@ class UIManager:
             return
 
         with st.expander("Current Token Analysis", expanded=True):
-            cols = st.columns([1, 3])
-            with cols[0]:
-                if current_token.get('logoURI'):
-                    st.image(current_token['logoURI'], width=80)
-            with cols[1]:
                 st.subheader(current_token.get('symbol', 'Unknown'))
                 st.caption(f"`{current_token.get('address', '')[:12]}...`")
 
