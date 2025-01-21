@@ -171,7 +171,9 @@ class AnalysisManager:
                 'results': [],
                 'params': None,
                 'metrics': {'start_time': None, 'speed': 0},
-                'current_index': 0
+                'current_index': 0,
+                'current_token': None,
+                'current_analysis': None
             }
         }
         for key, val in defaults.items():
@@ -189,7 +191,9 @@ class AnalysisManager:
                 'total_tokens': len(tokens)
             },
             'current_index': 0,
-            'tokens': tokens
+            'tokens': tokens,
+            'current_token': None,
+            'current_analysis': None
         }
 
     def process_tokens(self):
@@ -202,6 +206,11 @@ class AnalysisManager:
         if idx < len(tokens):
             token = tokens[idx]
             analysis = self.analyzer.analyze_token(token)
+            
+            # Store current processing information
+            st.session_state.analysis['current_token'] = token
+            st.session_state.analysis['current_analysis'] = analysis
+            
             if analysis and analysis['rating'] >= st.session_state.analysis['params']['min_rating']:
                 st.session_state.analysis['results'].append(analysis)
 
@@ -272,22 +281,36 @@ class UIManager:
         st.metric("Elapsed Time", f"{elapsed:.1f}s")
 
     def render_current_token(self):
-        if st.session_state.analysis['results']:
-            token = st.session_state.analysis['results'][-1]
-            with st.expander("Current Token Details", expanded=True):
-                cols = st.columns([1, 3])
-                with cols[0]:
-                    st.image(token.get('logoURI', 'https://via.placeholder.com/80'), width=60)
-                with cols[1]:
-                    st.subheader(f"{token.get('symbol', 'Unknown')}")
-                    st.caption(f"`{token.get('address', '')[6:]}...`")
-                
-                st.markdown(f"""
-                **Price:** ${token.get('price', 0.0):.4f}  
-                **Market Cap:** ${token.get('market_cap', 0.0):,.0f}  
-                **Rating:** {token.get('rating', 0.0):.1f}/100  
-                **Volume (24h):** ${token.get('volume', 0.0):,.0f}
-                """)
+        analysis_state = st.session_state.analysis
+        current_token = analysis_state.get('current_token')
+        current_analysis = analysis_state.get('current_analysis')
+
+        if not current_token:
+            return
+
+        with st.expander("Current Token Details", expanded=True):
+            cols = st.columns([1, 3])
+            with cols[0]:
+                logo_uri = current_token.get('logoURI', 'https://via.placeholder.com/80')
+                st.image(logo_uri, width=60)
+            with cols[1]:
+                symbol = current_token.get('symbol', 'Unknown')
+                st.subheader(f"{symbol}")
+                address = current_token.get('address', '')
+                shortened_address = f"{address[:6]}...{address[-4:]}" if address else ''
+                st.caption(f"`{shortened_address}`")
+            
+            price = current_analysis.get('price', 0.0) if current_analysis else 0.0
+            market_cap = current_analysis.get('market_cap', 0.0) if current_analysis else 0.0
+            rating = current_analysis.get('rating', 0.0) if current_analysis else 0.0
+            volume = current_analysis.get('volume', 0.0) if current_analysis else 0.0
+
+            st.markdown(f"""
+            **Price:** ${price:.4f}  
+            **Market Cap:** ${market_cap:,.0f}  
+            **Rating:** {rating:.1f}/100  
+            **Volume (24h):** ${volume:,.0f}
+            """)
 
     def start_analysis(self, params):
         tokens = self.analyzer.get_all_tokens(params['strict_mode'])
