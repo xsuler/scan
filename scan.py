@@ -1,5 +1,7 @@
 import streamlit as st
 import pandas as pd
+import traceback
+
 import requests
 import time
 import plotly.express as px
@@ -74,7 +76,6 @@ class TokenAnalyzer:
             price_data = self.get_token_price_data(token)
             if not price_data:
                 return None
-            st.info(price_data)
             analysis = {
                 'symbol': token.get('symbol', 'Unknown'),
                 'address': token['address'],
@@ -94,7 +95,7 @@ class TokenAnalyzer:
             analysis['rating'] = self.calculate_rating(analysis)
             return analysis
         except Exception as e:
-            st.error(f"Analysis failed for {token.get('symbol')}: {str(e)}")
+            st.error(f"Analysis failed for {token.get('symbol')}: {str(e)} {traceback.format_exc()}")
             return None
 
     def calculate_liquidity_score(self, token):
