@@ -3,7 +3,7 @@ import pandas as pd
 import traceback
 import requests
 import time
-import plotly.express as px
+import numpy as np
 from solders.pubkey import Pubkey
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -70,8 +70,11 @@ class TokenAnalyzer:
         finally:
             self.debug_info.append(debug_entry)
 
-    def ensure(self, v):
-        return v or 0
+    def safe_float(self, value, default=0.0):
+        try:
+            return float(value) if value not in [None, np.nan, ''] else default
+        except:
+            return default
 
     def analyze_token(self, token):
         try:
@@ -79,20 +82,18 @@ class TokenAnalyzer:
             analysis = {
                 'symbol': token.get('symbol', 'Unknown'),
                 'address': token['address'],
-                'price': float(price_data.get('price', 0)),
+                'price': self.safe_float(price_data.get('price', 0)),
                 'price_type': price_data.get('type', 'N/A'),
                 'liquidity': self.calculate_liquidity_score(token),
                 'confidence': price_data.get('confidence', 'medium'),
-                'buy_price': float(self.ensure(price_data.get('buy_price', 0))),
-                'sell_price': float(self.ensure(price_data.get('sell_price', 0))),
-                'price_impact_10': float(self.ensure(price_data.get('price_impact_10', 0))),
-                'price_impact_100': float(self.ensure(price_data.get('price_impact_100', 0))),
-                'last_buy_price': float(self.ensure(price_data.get('last_buy_price', 0))),
-                'last_sell_price': float(self.ensure(price_data.get('last_sell_price', 0))),
+                'buy_price': self.safe_float(price_data.get('buy_price', 0)),
+                'sell_price': self.safe_float(price_data.get('sell_price', 0)),
+                'price_impact_10': self.safe_float(price_data.get('price_impact_10', 0)),
+                'price_impact_100': self.safe_float(price_data.get('price_impact_100', 0)),
                 'explorer': f"https://solscan.io/token/{token['address']}",
             }
             
-            analysis['rating'] = self.calculate_rating(analysis)
+            analysis['score'] = self.calculate_score(analysis)
             return analysis
         except Exception as e:
             st.error(f"Analysis failed for {token.get('symbol')}: {str(e)}")
@@ -108,19 +109,63 @@ class TokenAnalyzer:
             )
             response.raise_for_status()
             quote = response.json()
-            return max(0.0, 100.0 - (float(quote.get('priceImpactPct', 1)) * 10000))
+            price_impact = self.safe_float(quote.get('priceImpactPct', 1))
+            return max(0.0, 100.0 - (price_impact * 10000))
         except Exception as e:
             print(f"Liquidity calculation error: {str(e)}")
             return 0.0
 
-    def calculate_rating(self, analysis):
+    def calculate_score(self, analysis):
         try:
-            liquidity = analysis['liquidity']
-            price_stability = (1 - abs(analysis['buy_price'] - analysis['sell_price'])/analysis['price']) if analysis['price'] != 0 else 0
-            market_depth = (1 - (analysis['price_impact_10'] + analysis['price_impact_100'])/2)
-            return liquidity + price_stability + market_depth
+            # 基础分数计算
+            liquidity = analysis['liquidity'] / 100  # 归一化到0-1范围
+            
+            # 价格稳定性计算（处理零值和异常）
+            price = analysis['price']
+            buy_price = analysis['buy_price']
+            sell_price = analysis['sell_price']
+            
+            if price <= 0 or (buy_price == 0 and sell_price == 0):
+                price_stability = 0.0
+            else:
+                spread = abs(buy_price - sell_price)
+                price_stability = 1 - (spread / price) if price != 0 else 0
+                price_stability = np.clip(price_stability, 0, 1)
+            
+            # 市场深度计算（处理缺失值）
+            impact_10 = analysis['price_impact_10']
+            impact_100 = analysis['price_impact_100']
+            avg_impact = (impact_10 + impact_100) / 2
+            market_depth = 1 - np.clip(avg_impact, 0, 1)
+            
+            # 加权得分（可调整权重）
+            weights = {
+                'liquidity': 0.4,
+                'price_stability': 0.35,
+                'market_depth': 0.25
+            }
+            
+            # 惩罚机制
+            penalties = 0
+            if price <= 0:
+                penalties += 0.3  # 无价格信息惩罚
+            if analysis['liquidity'] <= 0:
+                penalties += 0.2  # 无流动性惩罚
+            if analysis['confidence'] != 'high':
+                penalties += 0.1  # 低信心惩罚
+            
+            raw_score = (
+                weights['liquidity'] * liquidity +
+                weights['price_stability'] * price_stability +
+                weights['market_depth'] * market_depth
+            )
+            
+            # 应用惩罚并最终修正
+            final_score = (raw_score - penalties) * 100
+            return np.clip(final_score, 0, 100)
+            
         except KeyError as e:
-            print(f"Missing key in rating calculation: {str(e)}")
+            print(f"Missing key in score calculation: {str(e)}")
             return 0.0
 
     def get_token_price_data(self, token):
@@ -132,20 +177,19 @@ class TokenAnalyzer:
             response.raise_for_status()
             data = response.json()
             price_data = data.get('data', {}).get(token['address'], {})
+            
             return {
-                'price': price_data.get('price', 0),
+                'price': self.safe_float(price_data.get('price', 0)),
                 'type': price_data.get('type', 'N/A'),
                 'confidence': price_data.get('extraInfo', {}).get('confidenceLevel', 'medium'),
-                'buy_price': price_data.get('extraInfo', {}).get('quotedPrice', {}).get('buyPrice', 0),
-                'sell_price': price_data.get('extraInfo', {}).get('quotedPrice', {}).get('sellPrice', 0),
-                'price_impact_10': price_data.get('extraInfo', {}).get('depth', {}).get('sellPriceImpactRatio', {}).get('depth', {}).get('10', 0),
-                'price_impact_100': price_data.get('extraInfo', {}).get('depth', {}).get('sellPriceImpactRatio', {}).get('depth', {}).get('100', 0),
-                'last_buy_price': price_data.get('extraInfo', {}).get('lastSwappedPrice', {}).get('lastJupiterBuyPrice', 0),
-                'last_sell_price': price_data.get('extraInfo', {}).get('lastSwappedPrice', {}).get('lastJupiterSellPrice', 0)
+                'buy_price': self.safe_float(price_data.get('extraInfo', {}).get('quotedPrice', {}).get('buyPrice', 0)),
+                'sell_price': self.safe_float(price_data.get('extraInfo', {}).get('quotedPrice', {}).get('sellPrice', 0)),
+                'price_impact_10': self.safe_float(price_data.get('extraInfo', {}).get('depth', {}).get('sellPriceImpactRatio', {}).get('depth', {}).get('10', 0)),
+                'price_impact_100': self.safe_float(price_data.get('extraInfo', {}).get('depth', {}).get('sellPriceImpactRatio', {}).get('depth', {}).get('100', 0)),
             }
         except Exception as e:
             st.error(f"Price data error: {str(e)}")
-            return None
+            return {}
 
 class AnalysisManager:
     def __init__(self, analyzer):
@@ -225,12 +269,13 @@ class UIManager:
 
     def render_sidebar(self):
         with st.sidebar:
-            st.title("Real-time Solana Token Analyzer")
+            st.title("🪙 Solana Token Analyzer")
             st.image("https://jup.ag/svg/jupiter-logo.svg", width=200)
             
-            with st.expander("⚙️ Core Settings", expanded=True):
+            with st.expander("⚙️ Control Panel", expanded=True):
                 params = {
-                    'strict_mode': st.checkbox("Strict Validation", True)
+                    'strict_mode': st.checkbox("Strict Validation", True),
+                    'live_sorting': st.checkbox("Real-time Sorting", True)
                 }
 
             col1, col2 = st.columns(2)
@@ -239,11 +284,11 @@ class UIManager:
                     self.start_analysis(params)
             with col2:
                 if st.button("⏹ Stop Analysis", use_container_width=True):
-                    self.manager.stop_analysis()
+                    st.session_state.analysis['running'] = False
 
             st.divider()
-            if st.button("🧹 Clear Data"):
-                st.session_state.clear()
+            if st.button("🧹 Clear Results", use_container_width=True):
+                st.session_state.live_results = pd.DataFrame()
                 st.rerun()
 
             if st.session_state.analysis.get('running', False):
@@ -259,7 +304,7 @@ class UIManager:
         metrics = analysis['metrics']
         progress = analysis['progress'] / metrics['total_tokens']
         
-        st.progress(min(progress, 1.0))
+        st.progress(min(progress, 1.0), text="Analysis Progress")
         cols = st.columns(3)
         with cols[0]:
             st.metric("Processed", f"{analysis['progress']}/{metrics['total_tokens']}")
@@ -273,9 +318,11 @@ class UIManager:
         if not current_token:
             return
 
-        with st.expander("Current Token Analysis", expanded=True):
-                st.subheader(current_token.get('symbol', 'Unknown'))
-                st.caption(f"`{current_token.get('address', '')[:12]}...`")
+        with st.expander("🔍 Current Token", expanded=True):
+            st.subheader(current_token.get('symbol', 'Unknown'))
+            st.caption(f"`{current_token.get('address', '')[:12]}...`")
+            st.write(f"**Chain:** Solana Mainnet")
+            st.write(f"**Decimals:** {current_token.get('decimals', 'N/A')}")
 
     def start_analysis(self, params):
         tokens = self.analyzer.get_all_tokens(params['strict_mode'])
@@ -286,17 +333,53 @@ class UIManager:
             st.error("No tokens found matching criteria")
 
     def render_sidebar_results(self):
-        st.subheader("Real-time Analysis Results")
-        df = st.session_state.live_results.sort_values('rating', ascending=False)
+        st.subheader("📊 Live Results")
+        df = st.session_state.live_results
+        
+        # 动态排序控制
+        sort_column = 'score'
+        sort_ascending = False
+        
+        sorted_df = df.sort_values(
+            by=sort_column, 
+            ascending=sort_ascending
+        ).reset_index(drop=True)
+
         st.data_editor(
-            df,
+            sorted_df,
             column_config={
-                'symbol': 'Symbol',
-                'price': st.column_config.NumberColumn('Price', format="$%.4f"),
-                'rating': st.column_config.NumberColumn('Score', format="%.1f"),
-                'liquidity': st.column_config.NumberColumn('Liquidity', format="%.1f"),
-                'explorer': st.column_config.LinkColumn('Explorer'),
-                'confidence': 'Confidence'
+                'symbol': st.column_config.TextColumn(
+                    'Token',
+                    width='medium'
+                ),
+                'score': st.column_config.ProgressColumn(
+                    'Score',
+                    help="综合评分 (0-100)",
+                    format="%.1f",
+                    min_value=0,
+                    max_value=100
+                ),
+                'price': st.column_config.NumberColumn(
+                    'Price',
+                    format="$%.4f",
+                    help="当前市场价格"
+                ),
+                'liquidity': st.column_config.ProgressColumn(
+                    'Liquidity',
+                    help="流动性评分 (0-100)",
+                    format="%.1f",
+                    min_value=0,
+                    max_value=100
+                ),
+                'confidence': st.column_config.SelectboxColumn(
+                    'Confidence',
+                    help="价格信心等级",
+                    options=['low', 'medium', 'high']
+                ),
+                'explorer': st.column_config.LinkColumn(
+                    'Explorer',
+                    help="区块链浏览器链接"
+                )
             },
             height=600,
             use_container_width=True,
@@ -304,11 +387,12 @@ class UIManager:
             key="live_results_table"
         )
         
+        # 实时统计指标
         cols = st.columns(3)
         with cols[0]:
-            st.metric("Average Score", f"{df['rating'].mean():.1f}")
+            st.metric("Avg Score", f"{df['score'].mean():.1f}")
         with cols[1]:
-            st.metric("Top Liquidity", f"{df['liquidity'].max():.1f}")
+            st.metric("Top Score", f"{df['score'].max():.1f}")
         with cols[2]:
             st.metric("High Confidence", df[df['confidence'] == 'high'].shape[0])
 
