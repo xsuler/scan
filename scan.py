@@ -4,6 +4,8 @@ import requests
 import base58
 import time
 from datetime import datetime
+from solders.pubkey import Pubkey
+from solders.rpc.config import RpcContextConfig
 from solana.rpc.api import Client
 
 # Configuration
@@ -12,32 +14,48 @@ SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
 RESULTS_FILE = "solana_contract_scan.csv"
 
 # Initialize Solana client
-solana_client = Client(SOLANA_RPC_ENDPOINT)
+solana_client = Client(SOLANA_RPC_ENDPOINT, config=RpcContextConfig())
 
 # ======================
 # Blockchain Data Functions
 # ======================
 def fetch_token_list():
-    """Fetch complete token list from Jupiter Aggregator"""
+    """Fetch complete token list from Jupiter Aggregator with validation"""
     try:
         response = requests.get(JUPITER_TOKEN_LIST, timeout=10)
         response.raise_for_status()
-        return response.json()
+        tokens = response.json()
+        return [t for t in tokens if _is_valid_spl_token(t.get('address'))]
     except Exception as e:
         st.error(f"Token list fetch error: {str(e)}")
         return []
 
-def get_token_details(mint_address):
-    """Get on-chain token details including supply and metadata"""
+def _is_valid_spl_token(mint_address: str) -> bool:
+    """Validate if address is a proper SPL token using Solders"""
     try:
+        if mint_address == "So11111111111111111111111111111111111111112":
+            return False
+        Pubkey.from_string(mint_address)
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+def get_token_details(mint_address: str):
+    """Get on-chain token details with proper Pubkey handling"""
+    try:
+        pubkey = Pubkey.from_string(mint_address)
+        
         # Get token supply
-        supply_info = solana_client.get_token_supply(mint_address).value
-        decimals = supply_info.decimals if supply_info else 9
-        raw_supply = int(supply_info.amount) if supply_info else 0
+        supply_info = solana_client.get_token_supply(pubkey)
+        if not supply_info.value:
+            return None
+            
+        decimals = supply_info.value.decimals
+        raw_supply = int(supply_info.value.amount)
         supply = raw_supply / (10 ** decimals)
 
-        # Get mint timestamp from address
-        decoded = base58.b58decode(mint_address)
+        # Get mint timestamp from address bytes
+        decoded = bytes(pubkey)
         timestamp = int.from_bytes(decoded[:4], byteorder='big') / 1000
         age_days = (datetime.now() - datetime.fromtimestamp(timestamp)).days
 
@@ -46,7 +64,10 @@ def get_token_details(mint_address):
             f"https://price.jup.ag/v4/price?ids={mint_address}",
             timeout=5
         )
-        price_data = price_response.json() if price_response.status_code == 200 else {}
+        if price_response.status_code != 200:
+            return None
+            
+        price_data = price_response.json()
         price = price_data.get('data', {}).get(mint_address, {}).get('price', 0)
 
         return {
@@ -65,9 +86,12 @@ def get_token_details(mint_address):
 # Data Processing
 # ======================
 def process_token_entry(token):
-    """Process raw token data into structured format"""
+    """Process raw token data with enhanced validation"""
+    if not _is_valid_spl_token(token.get('address')):
+        return None
+
     details = get_token_details(token['address'])
-    if not details:
+    if not details or details['price'] <= 0:
         return None
 
     return {
@@ -86,13 +110,10 @@ def process_token_entry(token):
     }
 
 def calculate_liquidity_score(token, details):
-    """Calculate composite liquidity score"""
+    """Calculate composite liquidity score with market cap weighting"""
     score = 0
-    # Market cap component (0-50)
-    score += min(50, details['market_cap'] / 1e6 * 0.5)
-    # Verification bonus
+    score += min(50, details['market_cap'] / 1e6 * 0.5) if details['market_cap'] else 0
     score += 30 if token.get('extensions', {}).get('verified') else 0
-    # Age component
     score += min(20, details['age_days'] * 0.2)
     return round(score, 1)
 
@@ -102,31 +123,35 @@ def calculate_liquidity_score(token, details):
 class BlockchainAnalyzer:
     def __init__(self, params):
         self.params = params
-        self.required_fields = [
-            'symbol', 'contract_address', 'price', 
-            'market_cap', 'liquidity_score', 'verified'
-        ]
 
     def analyze_token(self, token):
-        """Apply analysis filters to token data"""
-        if not token or token['price'] <= 0:
+        """Apply analysis filters with type checking"""
+        if not token or not isinstance(token, dict):
             return None
 
-        checks = [
-            token['market_cap'] >= self.params['min_mcap'],
-            token['price'] >= self.params['min_price'],
-            token['liquidity_score'] >= self.params['min_liquidity'],
-            token['verified'] or not self.params['verified_only'],
-            token['age_days'] >= self.params['min_age']
-        ]
-
-        return token if all(checks) else None
+        try:
+            checks = [
+                token.get('market_cap', 0) >= self.params['min_mcap'],
+                token.get('price', 0) >= self.params['min_price'],
+                token.get('liquidity_score', 0) >= self.params['min_liquidity'],
+                token.get('verified', False) or not self.params['verified_only'],
+                token.get('age_days', 0) >= self.params['min_age']
+            ]
+            return token if all(checks) else None
+        except Exception as e:
+            st.error(f"Analysis error: {str(e)}")
+            return None
 
 # ======================
 # UI & Data Management
 # ======================
 def initialize_session():
-    """Initialize Streamlit session state"""
+    """Initialize Streamlit session state with validation"""
+    default_columns = [
+        'timestamp', 'symbol', 'contract_address', 'price',
+        'market_cap', 'liquidity_score', 'verified', 'age_days'
+    ]
+    
     if 'params' not in st.session_state:
         st.session_state.params = {
             'min_mcap': 1e4,
@@ -139,49 +164,55 @@ def initialize_session():
     if 'results' not in st.session_state:
         try:
             st.session_state.results = pd.read_csv(RESULTS_FILE)
+            for col in default_columns:
+                if col not in st.session_state.results.columns:
+                    st.session_state.results[col] = None
         except:
-            st.session_state.results = pd.DataFrame(columns=[
-                'timestamp', 'symbol', 'contract_address', 'price',
-                'market_cap', 'liquidity_score', 'verified', 'age_days'
-            ])
+            st.session_state.results = pd.DataFrame(columns=default_columns)
 
 def save_results():
-    """Persist results to CSV"""
-    st.session_state.results.to_csv(RESULTS_FILE, index=False)
+    """Persist results to CSV with validation"""
+    try:
+        st.session_state.results.to_csv(RESULTS_FILE, index=False)
+    except Exception as e:
+        st.error(f"Failed to save results: {str(e)}")
 
 def display_results():
-    """Render results in formatted dataframe"""
+    """Render results in formatted dataframe with error handling"""
     if st.session_state.results.empty:
         st.info("No scan results available. Run a scan first.")
         return
 
-    df = st.session_state.results.copy()
-    df['price'] = df['price'].apply(
-        lambda x: f"${x:.4f}" if x >= 0.0001 else f"${x:.8f}")
-    df['market_cap'] = df['market_cap'].apply(
-        lambda x: f"${x/1e3:,.1f}K" if x < 1e6 else f"${x/1e6:.2f}M")
-    
-    st.dataframe(
-        df.sort_values('market_cap', ascending=False),
-        column_config={
-            'symbol': 'Symbol',
-            'price': 'Price',
-            'market_cap': 'Market Cap',
-            'liquidity_score': st.column_config.ProgressColumn(
-                'Liquidity',
-                format="%.1f",
-                min_value=0,
-                max_value=100
-            ),
-            'contract_address': 'Contract Address',
-            'verified': 'Verified',
-            'age_days': 'Age (Days)',
-            'explorer': st.column_config.LinkColumn('Block Explorer')
-        },
-        height=700,
-        use_container_width=True,
-        hide_index=True
-    )
+    try:
+        df = st.session_state.results.copy()
+        df['price'] = df['price'].apply(
+            lambda x: f"${x:.4f}" if x >= 0.0001 else f"${x:.8f}")
+        df['market_cap'] = df['market_cap'].apply(
+            lambda x: f"${x/1e3:,.1f}K" if x < 1e6 else f"${x/1e6:.2f}M")
+        
+        st.dataframe(
+            df.sort_values('market_cap', ascending=False),
+            column_config={
+                'symbol': 'Symbol',
+                'price': 'Price',
+                'market_cap': 'Market Cap',
+                'liquidity_score': st.column_config.ProgressColumn(
+                    'Liquidity',
+                    format="%.1f",
+                    min_value=0,
+                    max_value=100
+                ),
+                'contract_address': 'Contract Address',
+                'verified': 'Verified',
+                'age_days': 'Age (Days)',
+                'explorer': st.column_config.LinkColumn('Block Explorer')
+            },
+            height=700,
+            use_container_width=True,
+            hide_index=True
+        )
+    except Exception as e:
+        st.error(f"Error displaying results: {str(e)}")
 
 # ======================
 # Streamlit UI
@@ -192,7 +223,7 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    st.title("🔭 Solana Smart Contract Analyzer")
+    st.title("🔭 Solana SPL Token Analyzer")
 
     initialize_session()
 
@@ -239,28 +270,31 @@ def main():
         if st.button("🔍 Start Blockchain Scan", type="primary"):
             with st.spinner("Scanning Solana blockchain..."):
                 start_time = time.time()
-                tokens = fetch_token_list()
-                analyzer = BlockchainAnalyzer(st.session_state.params)
-                
-                new_results = []
-                for token in tokens[:100]:  # Limit to first 100 for performance
-                    processed = process_token_entry(token)
-                    if result := analyzer.analyze_token(processed):
-                        new_results.append(result)
-                    time.sleep(0.1)  # Rate limiting
+                try:
+                    tokens = fetch_token_list()
+                    analyzer = BlockchainAnalyzer(st.session_state.params)
+                    
+                    new_results = []
+                    for token in tokens[:100]:  # Limit to first 100 for performance
+                        processed = process_token_entry(token)
+                        if result := analyzer.analyze_token(processed):
+                            new_results.append(result)
+                        time.sleep(0.2)  # Conservative rate limiting
 
-                if new_results:
-                    new_df = pd.DataFrame(new_results)
-                    st.session_state.results = pd.concat(
-                        [st.session_state.results, new_df],
-                        ignore_index=True
-                    ).drop_duplicates(['contract_address'], keep='last')
-                    save_results()
-                    st.success(f"Found {len(new_results)} qualifying contracts!")
-                else:
-                    st.warning("No matching contracts found")
-                
-                st.write(f"Scan duration: {time.time() - start_time:.2f} seconds")
+                    if new_results:
+                        new_df = pd.DataFrame(new_results)
+                        st.session_state.results = pd.concat(
+                            [st.session_state.results, new_df],
+                            ignore_index=True
+                        ).drop_duplicates(['contract_address'], keep='last')
+                        save_results()
+                        st.success(f"Found {len(new_results)} qualifying contracts!")
+                    else:
+                        st.warning("No matching contracts found")
+                    
+                    st.write(f"Scan duration: {time.time() - start_time:.2f} seconds")
+                except Exception as e:
+                    st.error(f"Scan failed: {str(e)}")
 
         st.download_button(
             "📥 Download Results",
