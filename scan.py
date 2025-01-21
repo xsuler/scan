@@ -65,29 +65,16 @@ class TokenAnalyzer:
             address = token.get('address', '')
             if not address:
                 reasons.append('No address')
-                st.error(1)
                 return False, reasons
                 
             try:
                 Pubkey.from_string(address)
             except:
-                st.error(2)
                 reasons.append('Invalid SPL address')
                 return False, reasons
 
-            if strict_checks:
-                checks = [
-                    ('symbol', lambda: token.get('symbol') not in ['SOL', 'USDC', 'USDT'], 'Excluded symbol'),
-                    ('price', lambda: float(token.get('price', 0)) > 0.000001, 'Price too low'),
-                    ('website', lambda: bool(token.get('extensions', {}).get('website')), 'Missing website'),
-                    ('twitter', lambda: bool(token.get('extensions', {}).get('twitter')), 'Missing twitter'),
-                    ('birdeye-tag', lambda: 'birdeye-trending' in token.get('tags', []), 'Missing trending tag')
-                ]
-            else:
-                checks = [
-                    ('symbol', lambda: bool(token.get('symbol')), 'Missing symbol'),
-                    ('name', lambda: bool(token.get('name')), 'Missing name'),
-                    ('price', lambda: float(token.get('price', 0)) > 0, 'Invalid price')
+            checks = [
+                    ('tag', lambda: token.get('tag')=="birdeye-trending", 'Missing symbol'),
                 ]
 
             passed = True
