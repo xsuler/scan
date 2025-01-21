@@ -248,7 +248,7 @@ def main():
             if st.button("⏹ Stop Analysis"):
                 st.session_state.analysis_state['running'] = False
                 clear_checkpoint()
-                st.experimental_rerun()
+                st.rerun()
 
     # Analysis progress section
     if st.session_state.analysis_state['running']:
@@ -280,13 +280,13 @@ def main():
                 
                 save_checkpoint(state)
                 time.sleep(0.1)  # Prevent UI freeze
-                st.experimental_rerun()
+                st.rerun()
                 
             except Exception as e:
                 error_container.error(f"Error processing token: {str(e)}")
                 state['processed'] += 1
                 save_checkpoint(state)
-                st.experimental_rerun()
+                st.rerun()
         else:
             st.session_state.analysis_state['running'] = False
             st.session_state.analysis_results = pd.DataFrame(state['results'])
