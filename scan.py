@@ -14,6 +14,8 @@ JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 UI_REFRESH_INTERVAL = 0.01
+ROW_HEIGHT = 35  # 每行高度（像素）
+HEADER_HEIGHT = 50  # 表头高度（像素）
 
 class TokenAnalyzer:
     def __init__(self):
@@ -117,10 +119,8 @@ class TokenAnalyzer:
 
     def calculate_score(self, analysis):
         try:
-            # 基础分数计算
-            liquidity = analysis['liquidity'] / 100  # 归一化到0-1范围
+            liquidity = analysis['liquidity'] / 100
             
-            # 价格稳定性计算（处理零值和异常）
             price = analysis['price']
             buy_price = analysis['buy_price']
             sell_price = analysis['sell_price']
@@ -132,35 +132,31 @@ class TokenAnalyzer:
                 price_stability = 1 - (spread / price) if price != 0 else 0
                 price_stability = np.clip(price_stability, 0, 1)
             
-            # 市场深度计算（处理缺失值）
             impact_10 = analysis['price_impact_10']
             impact_100 = analysis['price_impact_100']
             avg_impact = (impact_10 + impact_100) / 2
             market_depth = 1 - np.clip(avg_impact, 0, 1)
             
-            # 加权得分（可调整权重）
             weights = {
                 'liquidity': 0.4,
                 'price_stability': 0.35,
                 'market_depth': 0.25
             }
             
-            # 惩罚机制
             penalties = 0
             if price <= 0:
-                penalties += 0.3  # 无价格信息惩罚
+                penalties += 0.3
             if analysis['liquidity'] <= 0:
-                penalties += 0.2  # 无流动性惩罚
+                penalties += 0.2
             if analysis['confidence'] != 'high':
-                penalties += 0.1  # 低信心惩罚
-            
+                penalties += 0.1
+                
             raw_score = (
                 weights['liquidity'] * liquidity +
                 weights['price_stability'] * price_stability +
                 weights['market_depth'] * market_depth
             )
             
-            # 应用惩罚并最终修正
             final_score = (raw_score - penalties) * 100
             return np.clip(final_score, 0, 100)
             
@@ -332,25 +328,31 @@ class UIManager:
         else:
             st.error("No tokens found matching criteria")
 
+    def calculate_table_height(self, df):
+        """动态计算表格高度"""
+        num_rows = len(df)
+        base_height = HEADER_HEIGHT + num_rows * ROW_HEIGHT
+        return min(base_height, 600)  # 设置最大高度限制
+
     def render_sidebar_results(self):
         st.subheader("📊 Live Results")
         df = st.session_state.live_results
         
-        # 动态排序控制
+        # 动态排序
         sort_column = 'score'
         sort_ascending = False
+        sorted_df = df.sort_values(by=sort_column, ascending=sort_ascending)
         
-        sorted_df = df.sort_values(
-            by=sort_column, 
-            ascending=sort_ascending
-        ).reset_index(drop=True)
+        # 动态计算高度
+        table_height = self.calculate_table_height(sorted_df)
 
         st.data_editor(
             sorted_df,
             column_config={
                 'symbol': st.column_config.TextColumn(
                     'Token',
-                    width='medium'
+                    width='small',
+                    help="代币符号"
                 ),
                 'score': st.column_config.ProgressColumn(
                     'Score',
@@ -362,6 +364,7 @@ class UIManager:
                 'price': st.column_config.NumberColumn(
                     'Price',
                     format="$%.4f",
+                    width='small',
                     help="当前市场价格"
                 ),
                 'liquidity': st.column_config.ProgressColumn(
@@ -374,14 +377,16 @@ class UIManager:
                 'confidence': st.column_config.SelectboxColumn(
                     'Confidence',
                     help="价格信心等级",
-                    options=['low', 'medium', 'high']
+                    options=['low', 'medium', 'high'],
+                    width='small'
                 ),
                 'explorer': st.column_config.LinkColumn(
                     'Explorer',
-                    help="区块链浏览器链接"
+                    help="区块链浏览器链接",
+                    width='medium'
                 )
             },
-            height=600,
+            height=table_height,
             use_container_width=True,
             hide_index=True,
             key="live_results_table"
@@ -394,7 +399,7 @@ class UIManager:
         with cols[1]:
             st.metric("Top Score", f"{df['score'].max():.1f}")
         with cols[2]:
-            st.metric("High Confidence", df[df['confidence'] == 'high'].shape[0])
+            st.metric("High Conf", df[df['confidence'] == 'high'].shape[0])
 
     def render_main(self):
         if st.session_state.analysis.get('running', False):
