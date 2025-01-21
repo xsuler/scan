@@ -71,6 +71,11 @@ class TokenAnalyzer:
         finally:
             self.debug_info.append(debug_entry)
 
+    def ensure(self, v):
+        if v is None:
+            return 0
+        return v
+
     def analyze_token(self, token):
         try:
             price_data = self.get_token_price_data(token)
@@ -81,12 +86,12 @@ class TokenAnalyzer:
                 'price_type': price_data.get('type', 'N/A'),
                 'liquidity': self.calculate_liquidity_score(token),
                 'confidence': price_data.get('confidence', 'medium'),
-                'buy_price': float(price_data.get('buy_price', 0)),
-                'sell_price': float(price_data.get('sell_price', 0)),
-                'price_impact_10': float(price_data.get('price_impact_10', 0)),
-                'price_impact_100': float(price_data.get('price_impact_100', 0)),
-                'last_buy_price': float(price_data.get('last_buy_price', 0)),
-                'last_sell_price': float(price_data.get('last_sell_price', 0)),
+                'buy_price': float(self.ensure(price_data.get('buy_price', 0))),
+                'sell_price': float(self.ensure(price_data.get('sell_price', 0))),
+                'price_impact_10': float(self.ensure(price_data.get('price_impact_10', 0))),
+                'price_impact_100': float(self.ensure(price_data.get('price_impact_100', 0))),
+                'last_buy_price': float(self.ensure(price_data.get('last_buy_price', 0))),
+                'last_sell_price': float(self.ensure(price_data.get('last_sell_price', 0))),
                 'explorer': f"https://solscan.io/token/{token['address']}",
             }
             
