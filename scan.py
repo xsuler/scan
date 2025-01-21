@@ -1,8 +1,6 @@
 import streamlit as st
 import pandas as pd
 import requests
-import json
-import os
 import time
 import plotly.express as px
 from solders.pubkey import Pubkey
@@ -14,10 +12,7 @@ from urllib3.util.retry import Retry
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
 SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
 COINGECKO_API = "https://api.coingecko.com/api/v3"
-RESULTS_FILE = "token_analysis.csv"
-CHECKPOINT_FILE = "analysis_checkpoint.json"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-BATCH_SIZE = 5
 UI_REFRESH_INTERVAL = 0.01
 
 class TokenAnalyzer:
@@ -99,9 +94,9 @@ class TokenAnalyzer:
     def calculate_market_cap(self, token):
         try:
             supply = self.get_circulating_supply(token)
-            return supply * self.get_token_price(token)
+            return float(supply * self.get_token_price(token))
         except:
-            return 0
+            return 0.0
 
     def calculate_liquidity_score(self, token):
         try:
@@ -111,51 +106,57 @@ class TokenAnalyzer:
                 f"https://quote-api.jup.ag/v6/quote?inputMint={token['address']}&outputMint={USDC_MINT}&amount={amount}",
                 timeout=15
             ).json()
-            return max(0, 100 - (float(quote.get('priceImpactPct', 1)) * 10000))
+            return max(0.0, 100.0 - (float(quote.get('priceImpactPct', 1)) * 10000))
         except:
-            return 0
+            return 0.0
 
     def calculate_rating(self, analysis):
         try:
-            return min(100, (analysis['liquidity'] * 0.4) + 
-                       (analysis['market_cap'] / 1e6 * 0.3) + 
-                       (analysis['volume'] / 1e4 * 0.3))
+            return min(100.0, (analysis['liquidity'] * 0.4) + 
+                      (analysis['market_cap'] / 1e6 * 0.3) + 
+                      (analysis['volume'] / 1e4 * 0.3))
         except:
-            return 0
+            return 0.0
 
     def get_circulating_supply(self, token):
         try:
             account = self.client.get_account_info_json_parsed(Pubkey.from_string(token['address'])).value
-            return account.data.parsed['info']['supply'] / 10 ** token.get('decimals', 9)
+            return float(account.data.parsed['info']['supply'] / 10 ** token.get('decimals', 9))
         except:
-            return 0
+            return 0.0
 
     def get_token_price(self, token):
         try:
             return float(token.get('price', 0))
         except:
-            return 0
+            return 0.0
 
     def get_holder_count(self, token):
         try:
-            return self.client.get_token_supply(Pubkey.from_string(token['address'])).value.amount
+            return int(self.client.get_token_supply(Pubkey.from_string(token['address'])).value.amount)
         except:
             return 0
 
     def get_trading_volume(self, token):
         try:
-            return requests.get(
+            response = requests.get(
                 f"{COINGECKO_API}/coins/{token['extensions']['coingeckoId']}/market_chart",
-                params={'vs_currency': 'usd', 'days': '1'}
-            ).json()['total_volumes'][-1][1]
-        except:
-            return 0
+                params={'vs_currency': 'usd', 'days': '1'},
+                timeout=15
+            )
+            volumes = response.json().get('total_volumes', [])
+            if volumes:
+                return float(volumes[-1][1])
+            return 0.0
+        except Exception as e:
+            print(f"Volume error: {str(e)}")
+            return 0.0
 
     def get_token_age(self, token):
         try:
-            return (time.time() - token.get('timestamp', time.time())) / 86400
+            return float((time.time() - token.get('timestamp', time.time())) / 86400)
         except:
-            return 0
+            return 0.0
 
 class AnalysisManager:
     def __init__(self, analyzer):
@@ -170,8 +171,7 @@ class AnalysisManager:
                 'results': [],
                 'params': None,
                 'metrics': {'start_time': None, 'speed': 0}
-            },
-            'ui': {'container': None, 'progress': None, 'metrics': None}
+            }
         }
         for key, val in defaults.items():
             st.session_state.setdefault(key, val)
@@ -200,7 +200,6 @@ class AnalysisManager:
                 st.session_state.analysis['results'].append(analysis)
 
             st.session_state.analysis['progress'] = idx + 1
-            save_checkpoint()
             time.sleep(UI_REFRESH_INTERVAL)
             st.rerun()
 
@@ -209,7 +208,6 @@ class AnalysisManager:
     def finalize_analysis(self):
         st.session_state.analysis['running'] = False
         st.session_state.results = pd.DataFrame(st.session_state.analysis['results'])
-        clear_checkpoint()
         st.rerun()
 
 class UIManager:
@@ -245,8 +243,7 @@ class UIManager:
                     self.stop_analysis()
 
             st.divider()
-            if st.button("🧹 Clear Cache"):
-                clear_checkpoint()
+            if st.button("🧹 Clear Data"):
                 st.session_state.clear()
                 st.rerun()
 
@@ -273,29 +270,25 @@ class UIManager:
                 with cols[0]:
                     st.image(token.get('logoURI', 'https://via.placeholder.com/80'), width=60)
                 with cols[1]:
-                    st.subheader(f"{token['symbol']}")
-                    st.caption(f"`{token['address'][:6]}...{token['address'][-4:]}`")
+                    st.subheader(f"{token.get('symbol', 'Unknown')}")
+                    st.caption(f"`{token.get('address', '')[6:]}...`")
                 
                 st.markdown(f"""
-                **Price:** ${token['price']:.4f}  
-                **Market Cap:** ${token['market_cap']:,.0f}  
-                **Rating:** {token['rating']:.1f}/100  
-                **Volume (24h):** ${token['volume']:,.0f}
+                **Price:** ${token.get('price', 0.0):.4f}  
+                **Market Cap:** ${token.get('market_cap', 0.0):,.0f}  
+                **Rating:** {token.get('rating', 0.0):.1f}/100  
+                **Volume (24h):** ${token.get('volume', 0.0):,.0f}
                 """)
 
     def start_analysis(self, params):
-        if checkpoint := load_checkpoint():
-            self.manager.start_analysis(checkpoint['params']['tokens'], params)
+        tokens = self.analyzer.get_all_tokens(params['strict_mode'])
+        if tokens:
+            self.manager.start_analysis(tokens, params)
         else:
-            tokens = self.analyzer.get_all_tokens(params['strict_mode'])
-            if tokens:
-                self.manager.start_analysis(tokens, params)
-            else:
-                st.error("No tokens found matching criteria")
+            st.error("No tokens found matching criteria")
 
     def stop_analysis(self):
         st.session_state.analysis['running'] = False
-        clear_checkpoint()
         st.rerun()
 
     def render_main(self):
@@ -347,28 +340,6 @@ class UIManager:
             fig = px.histogram(df, x='liquidity', nbins=20,
                              title="Liquidity Distribution")
             st.plotly_chart(fig, use_container_width=True)
-
-def save_checkpoint():
-    data = {
-        'params': st.session_state.analysis['params'],
-        'results': st.session_state.analysis['results'],
-        'progress': st.session_state.analysis['progress']
-    }
-    with open(CHECKPOINT_FILE, 'w') as f:
-        json.dump(data, f)
-
-def load_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
-        try:
-            with open(CHECKPOINT_FILE) as f:
-                return json.load(f)
-        except:
-            pass
-    return None
-
-def clear_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
-        os.remove(CHECKPOINT_FILE)
 
 if __name__ == "__main__":
     analyzer = TokenAnalyzer()
