@@ -296,9 +296,6 @@ class UIManager:
         
         if st.session_state.get('results') is not None:
             self.render_results()
-            
-        if st.session_state.analysis.get('running', False):
-            st.rerun()
 
     def render_results(self):
         tab1, tab2 = st.tabs(["Analysis Results", "Market Overview"])
