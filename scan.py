@@ -14,8 +14,8 @@ JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 UI_REFRESH_INTERVAL = 0.01
-ROW_HEIGHT = 35
-HEADER_HEIGHT = 50
+ROW_HEIGHT = 35  # 每行高度（像素）
+HEADER_HEIGHT = 50  # 表头高度（像素）
 
 class TokenAnalyzer:
     def __init__(self):
@@ -67,7 +67,7 @@ class TokenAnalyzer:
             debug_entry['valid'] = True
             return True
         except Exception as e:
-            debug_entry['reasons'].append(f"Validation error: {str(e)}")
+            debug_entry['reasons'].append(f'Validation error: {str(e)}')
             return False
         finally:
             self.debug_info.append(debug_entry)
@@ -82,7 +82,6 @@ class TokenAnalyzer:
         try:
             price_data = self.get_token_price_data(token)
             analysis = {
-                'score': 0.0,  # Placeholder for score
                 'symbol': token.get('symbol', 'Unknown'),
                 'address': token['address'],
                 'price': self.safe_float(price_data.get('price', 0)),
@@ -263,35 +262,41 @@ class UIManager:
     def __init__(self, analyzer):
         self.analyzer = analyzer
         self.manager = AnalysisManager(analyzer)
+        self.inject_css()
 
-    def apply_custom_style(self):
-        st.markdown(
-            """
-            <style>
+    def inject_css(self):
+        """注入自定义CSS实现侧边栏全屏展示"""
+        st.markdown("""
+        <style>
+            /* 隐藏折叠按钮 */
+            [data-testid="collapsedControl"] {
+                display: none !important;
+            }
+            
+            /* 设置侧边栏宽度为100% */
+            section[data-testid="stSidebar"] {
+                width: 100% !important;
+                min-width: 100% !important;
+            }
+
+            /* 主内容区适配 */
+            .stApp {
+                flex-direction: column;
+            }
+
+            /* 移动端适配 */
+            @media (max-width: 768px) {
                 section[data-testid="stSidebar"] {
                     width: 100% !important;
-                    max-width: 100% !important;
-                }
-                .stApp {
-                    margin-left: 0;
-                }
-                .st-emotion-cache-uf99v8 {
-                    padding: 0;
-                    width: 100%;
-                }
-                div[data-testid="stExpander"] {
-                    width: 100%;
                 }
                 div[data-testid="stVerticalBlock"] {
-                    gap: 0.5rem;
+                    padding: 0 1rem;
                 }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
+            }
+        </style>
+        """, unsafe_allow_html=True)
 
     def render_sidebar(self):
-        self.apply_custom_style()
         with st.sidebar:
             st.title("🪙 Solana Token Analyzer")
             st.image("https://jup.ag/svg/jupiter-logo.svg", width=200)
@@ -365,21 +370,24 @@ class UIManager:
         st.subheader("📊 Live Results")
         df = st.session_state.live_results
         
-        # Reorder columns with score first
-        column_order = ['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer']
-        sorted_df = df[column_order].sort_values(by='score', ascending=False)
+        # 动态排序和列顺序调整
+        sort_column = 'score'
+        sort_ascending = False
+        sorted_df = df.sort_values(by=sort_column, ascending=sort_ascending)
         
+        # 调整列顺序（score第一列）
+        sorted_df = sorted_df[['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer']]
+
         table_height = self.calculate_table_height(sorted_df)
 
         st.data_editor(
             sorted_df,
             column_config={
-                'score': st.column_config.ProgressColumn(
+                'score': st.column_config.NumberColumn(
                     'Score',
                     help="综合评分 (0-100)",
                     format="%.1f",
-                    min_value=0,
-                    max_value=100
+                    width='small'
                 ),
                 'symbol': st.column_config.TextColumn(
                     'Token',
@@ -411,12 +419,14 @@ class UIManager:
                     width='medium'
                 )
             },
+            column_order=['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer'],
             height=table_height,
             use_container_width=True,
             hide_index=True,
             key="live_results_table"
         )
         
+        # 实时统计指标
         cols = st.columns(3)
         with cols[0]:
             st.metric("Avg Score", f"{df['score'].mean():.1f}")
@@ -426,9 +436,11 @@ class UIManager:
             st.metric("High Conf", df[df['confidence'] == 'high'].shape[0])
 
     def render_main(self):
-        pass
+        if st.session_state.analysis.get('running', False):
+            self.manager.process_tokens()
 
 if __name__ == "__main__":
     analyzer = TokenAnalyzer()
     ui = UIManager(analyzer)
     ui.render_sidebar()
+    ui.render_main()
