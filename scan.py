@@ -129,8 +129,9 @@ class TokenAnalyzer:
                 f"{JUPITER_PRICE_API}?ids={token['address']}",
                 timeout=15
             )
+            st.info(response.text)
+
             response.raise_for_status()
-            st.info(response.json())
             data = response.json()
             price_data = data.get('data', {}).get(token['address'], {})
             if price_data:
