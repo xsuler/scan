@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
-from datetime import datetime, timedelta
 from solders.pubkey import Pubkey
 from solana.rpc.api import Client
 from requests.adapters import HTTPAdapter
@@ -10,10 +9,9 @@ from urllib3.util.retry import Retry
 
 # Configuration
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
-JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
 RESULTS_FILE = "token_analysis.csv"
-REQUEST_INTERVAL = 0.5
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 class TokenAnalyzer:
     def __init__(self):
@@ -24,70 +22,46 @@ class TokenAnalyzer:
         self.session.mount('https://', HTTPAdapter(max_retries=retries))
         self.debug_info = []
         
-    def get_recent_tokens(self, days=3, strict_checks=True):
-        """Improved token filtering with detailed debug info"""
+    def get_all_tokens(self, strict_checks=True):
+        """Get all tokens with validation"""
         self.debug_info = []
         try:
-            cutoff_date = datetime.now() - timedelta(days=days)
             response = self.session.get(JUPITER_TOKEN_LIST, timeout=15)
             tokens = response.json()
-            st.info(tokens[0])
             
-            recent_tokens = []
+            valid_tokens = []
             for t in tokens:
                 debug_entry = {
                     'symbol': t.get('symbol', 'Unknown'),
                     'address': t.get('address', ''),
-                    'raw_time': t.get('timeAdded', ''),
                     'valid': False,
                     'reasons': [],
-                    'parsed_time': None,
-                    'time_valid': False,
                     'checks_passed': 0
                 }
                 
                 try:
-                    # Parse timestamp with timezone handling
-                    time_str = t.get('timeAdded', '')
-                    if 'Z' in time_str:
-                        time_str = time_str.replace('Z', '+00:00')
-                    added_date = datetime.fromisoformat(time_str)
-                    debug_entry['parsed_time'] = added_date.isoformat()
-                    
-                    # Check time validity
-                    time_valid = added_date > cutoff_date
-                    debug_entry['time_valid'] = time_valid
-                    if not time_valid:
-                        debug_entry['reasons'].append('Too old')
-                        self.debug_info.append(debug_entry)
-                        continue
-
-                    # Validate token
                     validation_result, reasons = self._valid_token(t, strict_checks)
                     debug_entry['reasons'] = reasons
                     debug_entry['checks_passed'] = len([r for r in reasons if not r.startswith('Failed')])
                     
                     if validation_result:
                         debug_entry['valid'] = True
-                        recent_tokens.append(t)
-                    else:
-                        debug_entry['valid'] = False
+                        valid_tokens.append(t)
                         
                 except Exception as e:
-                    debug_entry['reasons'].append(f'Parse error: {str(e)}')
+                    debug_entry['reasons'].append(f'Validation error: {str(e)}')
                     
                 self.debug_info.append(debug_entry)
                 
-            return recent_tokens
+            return valid_tokens
         except Exception as e:
             st.error(f"Token fetch error: {str(e)}")
             return []
 
     def _valid_token(self, token, strict_checks):
-        """Validation with detailed rejection reasons"""
+        """Token validation with birdeye-trending requirement"""
         reasons = []
         try:
-            # Basic checks
             address = token.get('address', '')
             if not address:
                 reasons.append('No address')
@@ -99,13 +73,13 @@ class TokenAnalyzer:
                 reasons.append('Invalid SPL address')
                 return False, reasons
 
-            # Strict mode checks
             if strict_checks:
                 checks = [
                     ('symbol', lambda: token.get('symbol') not in ['SOL', 'USDC', 'USDT'], 'Excluded symbol'),
                     ('price', lambda: float(token.get('price', 0)) > 0.000001, 'Price too low'),
                     ('website', lambda: bool(token.get('extensions', {}).get('website')), 'Missing website'),
-                    ('twitter', lambda: bool(token.get('extensions', {}).get('twitter')), 'Missing twitter')
+                    ('twitter', lambda: bool(token.get('extensions', {}).get('twitter')), 'Missing twitter'),
+                    ('birdeye-tag', lambda: 'birdeye-trending' in token.get('tags', []), 'Missing trending tag')
                 ]
             else:
                 checks = [
@@ -128,11 +102,77 @@ class TokenAnalyzer:
             reasons.append(f'Validation error: {str(e)}')
             return False, reasons
 
-    # [Keep rest of the analysis methods unchanged from previous version]
+    def deep_analyze(self, token):
+        """Perform comprehensive token analysis"""
+        try:
+            analysis = {
+                'symbol': token.get('symbol', 'Unknown'),
+                'address': token['address'],
+                'price': float(token.get('price', 0)),
+                'market_cap': self._estimate_market_cap(token),
+                'liquidity_score': self._calculate_liquidity(token),
+                'rating': self._calculate_rating(token),
+                'explorer': f"https://solscan.io/token/{token['address']}",
+                'supply': self._get_circulating_supply(token)
+            }
+            return analysis
+        except Exception as e:
+            st.error(f"Analysis failed for {token.get('symbol')}: {str(e)}")
+            return None
+
+    def _estimate_market_cap(self, token):
+        """Market cap estimation using circulating supply"""
+        try:
+            supply = self._get_circulating_supply(token)
+            return supply * float(token.get('price', 0))
+        except:
+            return 0
+
+    def _calculate_liquidity(self, token):
+        """Liquidity scoring using Jupiter swap simulation"""
+        try:
+            input_mint = token['address']
+            decimals = token.get('decimals', 9)
+            amount = int(1000 * (10 ** decimals))  # Simulate 1000 token swap
+            
+            quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={USDC_MINT}&amount={amount}"
+            response = self.session.get(quote_url, timeout=15)
+            quote = response.json()
+            
+            price_impact = float(quote.get('priceImpactPct', 1))
+            return max(0, 100 - (price_impact * 10000))  # Convert impact to liquidity score
+        except:
+            return 0
+
+    def _calculate_rating(self, token):
+        """Composite rating system"""
+        try:
+            score = 0
+            liquidity = self._calculate_liquidity(token)
+            mcap = self._estimate_market_cap(token)
+            
+            # Liquidity component (0-60)
+            score += liquidity * 0.6
+            
+            # Market cap component (0-40)
+            score += 40 * (1 / (1 + (mcap / 1e6)))  # Inverse scaling
+            
+            return min(100, max(0, round(score, 2)))
+        except:
+            return 0
+
+    def _get_circulating_supply(self, token):
+        """Get circulating supply from chain"""
+        try:
+            mint_address = Pubkey.from_string(token['address'])
+            account_info = self.client.get_account_info_json_parsed(mint_address).value
+            return account_info.data.parsed['info']['supply'] / 10 ** token.get('decimals', 9)
+        except:
+            return 0
 
 def main():
-    st.set_page_config(page_title="Token Analyst Pro+", layout="wide")
-    st.title("🔍 Token Discovery with Debug Info")
+    st.set_page_config(page_title="Token Analyst Pro", layout="wide")
+    st.title("🔍 Pure On-Chain Token Analysis")
     
     analyzer = TokenAnalyzer()
     
@@ -141,15 +181,14 @@ def main():
 
     with st.sidebar:
         st.header("Parameters")
-        days = st.slider("Lookback Days", 1, 7, 3)
         min_rating = st.slider("Minimum Rating", 0, 100, 65)
         min_mcap = st.number_input("Minimum Market Cap (USD)", 1000, 10000000, 10000)
-        strict_mode = st.checkbox("Strict Validation", value=False)
+        strict_mode = st.checkbox("Strict Validation", value=True)
         show_debug = st.checkbox("Show Debug Info", value=False)
         
-        if st.button("🔍 Find Promising Tokens"):
-            with st.spinner("Scanning new listings..."):
-                tokens = analyzer.get_recent_tokens(days=days, strict_checks=strict_mode)
+        if st.button("🔍 Analyze Tokens"):
+            with st.spinner("Scanning blockchain..."):
+                tokens = analyzer.get_all_tokens(strict_checks=strict_mode)
                 if not tokens:
                     st.error("No tokens found. Try adjusting filters.")
                     return
@@ -164,7 +203,7 @@ def main():
                     progress_bar.progress((idx + 1) / len(tokens))
                 
                 st.session_state.analysis_results = pd.DataFrame(results)
-                st.success(f"Found {len(results)} qualifying tokens")
+                st.success(f"Analyzed {len(results)} qualifying tokens")
                 progress_bar.empty()
 
         if not st.session_state.analysis_results.empty:
@@ -176,12 +215,9 @@ def main():
             )
 
     if show_debug and hasattr(analyzer, 'debug_info'):
-        st.subheader("🚨 Debug Information - Token Listing")
+        st.subheader("🔧 Validation Debug Info")
         debug_df = pd.DataFrame(analyzer.debug_info)
-        
-        # Filter and format debug info
-        debug_df = debug_df[['symbol', 'address', 'raw_time', 'parsed_time', 
-                           'time_valid', 'checks_passed', 'reasons']]
+        debug_df = debug_df[['symbol', 'address', 'checks_passed', 'reasons']]
         debug_df['reasons'] = debug_df['reasons'].apply(lambda x: '\n'.join(x))
         
         st.dataframe(
@@ -189,14 +225,10 @@ def main():
             column_config={
                 'symbol': 'Symbol',
                 'address': 'Contract',
-                'raw_time': 'Raw TimeAdded',
-                'parsed_time': 'Parsed Time',
-                'time_valid': 'Time Valid',
                 'checks_passed': 'Checks Passed',
                 'reasons': 'Validation Reasons'
             },
-            hide_index=True,
-            height=600,
+            height=400,
             use_container_width=True
         )
 
@@ -205,7 +237,7 @@ def main():
             st.session_state.analysis_results['rating'] >= min_rating
         ].sort_values('rating', ascending=False)
         
-        st.subheader("Top Candidate Tokens")
+        st.subheader("📊 Analysis Results")
         st.dataframe(
             filtered,
             column_config={
@@ -215,9 +247,6 @@ def main():
                 'market_cap': st.column_config.NumberColumn('Market Cap', format="$%.2f"),
                 'rating': st.column_config.ProgressColumn('Rating', min_value=0, max_value=100),
                 'liquidity_score': 'Liquidity',
-                'volatility': 'Volatility',
-                'depth_quality': 'Depth',
-                'confidence': 'Confidence',
                 'explorer': st.column_config.LinkColumn('Explorer'),
                 'supply': 'Circulating Supply'
             },
