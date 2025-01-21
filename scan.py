@@ -74,7 +74,7 @@ class TokenAnalyzer:
     def analyze_token(self, token):
         try:
             price_data = self.get_token_price_data(token)
-            if not price_data:
+            if price_data is None:
                 return None
             analysis = {
                 'symbol': token.get('symbol', 'Unknown'),
@@ -210,7 +210,7 @@ class AnalysisManager:
             analysis = self.analyzer.analyze_token(token)
             
             # Only update current analysis if successful
-            if analysis:
+            if analysis is not None:
                 st.session_state.analysis['current_token'] = token
                 st.session_state.analysis['current_analysis'] = analysis
                 
