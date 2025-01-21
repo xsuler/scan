@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import requests
+import json
+import os
 import time
 from solders.pubkey import Pubkey
 from solana.rpc.api import Client
@@ -11,6 +13,7 @@ from urllib3.util.retry import Retry
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
 SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
 RESULTS_FILE = "token_analysis.csv"
+CHECKPOINT_FILE = "analysis_checkpoint.json"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 class TokenAnalyzer:
@@ -52,7 +55,6 @@ class TokenAnalyzer:
                     debug_entry['reasons'].append(f'Validation error: {str(e)}')
                     
                 self.debug_info.append(debug_entry)
-            st.error(len(valid_tokens)) 
             return valid_tokens
             
         except Exception as e:
@@ -74,10 +76,23 @@ class TokenAnalyzer:
                 reasons.append('Invalid SPL address')
                 return False, reasons
 
+            required_fields = [
+                ('symbol', 'Missing symbol'),
+                ('name', 'Missing name'),
+                ('decimals', 'Missing decimals'),
+                ('logoURI', 'Missing logo')
+            ]
             
             checks = [
-                    ('tag', lambda: "community" in token.get('tags') or "old-registry" in token.get("tags"), 'Missing symbol'),
-                ]
+                ('tag', lambda: "community" in token.get('tags') or "old-registry" in token.get("tags"), 'Missing community tag'),
+                ('extensions', lambda: 'coingeckoId' in token.get('extensions', {}), 'Missing Coingecko ID'),
+                ('strict', lambda: not strict_checks or (token.get('chainId') == 101 and token.get('address')), 'Strict check failed')
+            ]
+
+            for field, message in required_fields:
+                if field not in token or not token[field]:
+                    reasons.append(f'Missing {field}: {message}')
+                    return False, reasons
 
             passed = True
             for check_name, check_func, msg in checks:
@@ -161,14 +176,35 @@ class TokenAnalyzer:
         except:
             return 0
 
+def save_checkpoint(data):
+    with open(CHECKPOINT_FILE, 'w') as f:
+        json.dump(data, f)
+
+def load_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'r') as f:
+            return json.load(f)
+    return None
+
+def clear_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+
 def main():
     st.set_page_config(page_title="Token Analyst Pro", layout="wide")
     st.title("🔍 Pure On-Chain Token Analysis")
     
     analyzer = TokenAnalyzer()
-    
-    if 'analysis_results' not in st.session_state:
-        st.session_state.analysis_results = pd.DataFrame()
+
+    # Initialize session state
+    if 'analysis_state' not in st.session_state:
+        st.session_state.analysis_state = {
+            'running': False,
+            'processed': 0,
+            'total': 0,
+            'results': [],
+            'params': None
+        }
 
     with st.sidebar:
         st.header("Parameters")
@@ -176,54 +212,89 @@ def main():
         min_mcap = st.number_input("Minimum Market Cap (USD)", 1000, 10000000, 10000)
         strict_mode = st.checkbox("Strict Validation", value=True)
         show_debug = st.checkbox("Show Debug Info", value=False)
-        
-        if st.button("🔍 Analyze Tokens"):
-            with st.spinner("Scanning blockchain..."):
-                tokens = analyzer.get_all_tokens(strict_checks=strict_mode)
-                if not tokens:
-                    st.error("No tokens found. Try adjusting filters.")
-                    return
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔍 Start Analysis"):
+                checkpoint = load_checkpoint()
+                if checkpoint:
+                    st.session_state.analysis_state.update({
+                        'running': True,
+                        'processed': checkpoint['processed'],
+                        'total': checkpoint['total'],
+                        'results': checkpoint['results'],
+                        'params': checkpoint['params']
+                    })
+                else:
+                    tokens = analyzer.get_all_tokens(strict_checks=strict_mode)
+                    if not tokens:
+                        st.error("No tokens found. Try adjusting filters.")
+                        return
                     
-                results = []
-                progress_bar = st.progress(0)
-                
-                for idx, token in enumerate(tokens):
-                    analysis = analyzer.deep_analyze(token)
-                    if analysis and analysis['market_cap'] >= min_mcap:
-                        results.append(analysis)
-                    progress_bar.progress((idx + 1) / len(tokens))
-                
-                st.session_state.analysis_results = pd.DataFrame(results)
-                st.success(f"Analyzed {len(results)} qualifying tokens")
-                progress_bar.empty()
+                    st.session_state.analysis_state = {
+                        'running': True,
+                        'processed': 0,
+                        'total': len(tokens),
+                        'results': [],
+                        'params': {
+                            'min_mcap': min_mcap,
+                            'strict_mode': strict_mode,
+                            'tokens': tokens
+                        }
+                    }
+                    save_checkpoint(st.session_state.analysis_state)
 
-        if not st.session_state.analysis_results.empty:
-            st.download_button(
-                "📥 Export Report",
-                data=st.session_state.analysis_results.to_csv(index=False),
-                file_name=RESULTS_FILE,
-                mime="text/csv"
-            )
+        with col2:
+            if st.button("⏹ Stop Analysis"):
+                st.session_state.analysis_state['running'] = False
+                clear_checkpoint()
+                st.experimental_rerun()
 
-    if show_debug and hasattr(analyzer, 'debug_info'):
-        st.subheader("🔧 Validation Debug Info")
-        debug_df = pd.DataFrame(analyzer.debug_info)
-        debug_df = debug_df[['symbol', 'address', 'checks_passed', 'reasons']]
-        debug_df['reasons'] = debug_df['reasons'].apply(lambda x: '\n'.join(x))
+    # Analysis progress section
+    if st.session_state.analysis_state['running']:
+        st.subheader("Analysis Progress")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        error_container = st.container()
         
-        st.dataframe(
-            debug_df,
-            column_config={
-                'symbol': 'Symbol',
-                'address': 'Contract',
-                'checks_passed': 'Checks Passed',
-                'reasons': 'Validation Reasons'
-            },
-            height=400,
-            use_container_width=True
-        )
+        state = st.session_state.analysis_state
+        tokens = state['params']['tokens']
+        min_mcap = state['params']['min_mcap']
+        
+        if state['processed'] < state['total']:
+            token = tokens[state['processed']]
+            try:
+                analysis = analyzer.deep_analyze(token)
+                if analysis and analysis['market_cap'] >= min_mcap:
+                    state['results'].append(analysis)
+                
+                state['processed'] += 1
+                progress = state['processed'] / state['total']
+                progress_bar.progress(progress)
+                
+                status_text.markdown(f"""
+                **Progress:** {state['processed']}/{state['total']} tokens  
+                **Valid Tokens Found:** {len(state['results'])}  
+                **Current Token:** {token.get('symbol', 'Unknown')} ({token['address'][:6]}...)
+                """)
+                
+                save_checkpoint(state)
+                time.sleep(0.1)  # Prevent UI freeze
+                st.experimental_rerun()
+                
+            except Exception as e:
+                error_container.error(f"Error processing token: {str(e)}")
+                state['processed'] += 1
+                save_checkpoint(state)
+                st.experimental_rerun()
+        else:
+            st.session_state.analysis_state['running'] = False
+            st.session_state.analysis_results = pd.DataFrame(state['results'])
+            clear_checkpoint()
+            st.success("✅ Analysis completed successfully!")
 
-    if not st.session_state.analysis_results.empty:
+    # Display results
+    if not st.session_state.analysis_state['running'] and 'analysis_results' in st.session_state:
         filtered = st.session_state.analysis_results[
             st.session_state.analysis_results['rating'] >= min_rating
         ].sort_values('rating', ascending=False)
@@ -243,6 +314,32 @@ def main():
             },
             hide_index=True,
             height=600,
+            use_container_width=True
+        )
+        
+        st.download_button(
+            "📥 Export Report",
+            data=filtered.to_csv(index=False),
+            file_name=RESULTS_FILE,
+            mime="text/csv"
+        )
+
+    # Debug information
+    if show_debug and hasattr(analyzer, 'debug_info'):
+        st.subheader("🔧 Validation Debug Info")
+        debug_df = pd.DataFrame(analyzer.debug_info)
+        debug_df = debug_df[['symbol', 'address', 'checks_passed', 'reasons']]
+        debug_df['reasons'] = debug_df['reasons'].apply(lambda x: '\n'.join(x))
+        
+        st.dataframe(
+            debug_df,
+            column_config={
+                'symbol': 'Symbol',
+                'address': 'Contract',
+                'checks_passed': 'Checks Passed',
+                'reasons': 'Validation Reasons'
+            },
+            height=400,
             use_container_width=True
         )
 
