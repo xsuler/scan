@@ -298,7 +298,7 @@ class UIManager:
             self.render_results()
             
         if st.session_state.analysis.get('running', False):
-            st.experimental_rerun()
+            st.rerun()
 
     def render_results(self):
         tab1, tab2 = st.tabs(["Analysis Results", "Market Overview"])
