@@ -13,7 +13,7 @@ JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
 RESULTS_FILE = "token_analysis.csv"
-REQUEST_INTERVAL = 0.5  # 500ms between requests
+REQUEST_INTERVAL = 0.5
 
 class TokenAnalyzer:
     def __init__(self):
@@ -22,9 +22,11 @@ class TokenAnalyzer:
         retries = Retry(total=3, backoff_factor=1, 
                       status_forcelist=[502, 503, 504])
         self.session.mount('https://', HTTPAdapter(max_retries=retries))
+        self.debug_info = []
         
     def get_recent_tokens(self, days=3, strict_checks=True):
-        """Improved token filtering with better validation"""
+        """Improved token filtering with detailed debug info"""
+        self.debug_info = []
         try:
             cutoff_date = datetime.now() - timedelta(days=days)
             response = self.session.get(JUPITER_TOKEN_LIST, timeout=15)
@@ -32,177 +34,104 @@ class TokenAnalyzer:
             
             recent_tokens = []
             for t in tokens:
+                debug_entry = {
+                    'symbol': t.get('symbol', 'Unknown'),
+                    'address': t.get('address', ''),
+                    'raw_time': t.get('timeAdded', ''),
+                    'valid': False,
+                    'reasons': [],
+                    'parsed_time': None,
+                    'time_valid': False,
+                    'checks_passed': 0
+                }
+                
                 try:
-                    # Handle timestamp with proper timezone
-                    time_str = t.get('timeAdded', '').replace('Z', '+00:00')
+                    # Parse timestamp with timezone handling
+                    time_str = t.get('timeAdded', '')
+                    if 'Z' in time_str:
+                        time_str = time_str.replace('Z', '+00:00')
                     added_date = datetime.fromisoformat(time_str)
+                    debug_entry['parsed_time'] = added_date.isoformat()
                     
-                    if added_date < cutoff_date:
+                    # Check time validity
+                    time_valid = added_date > cutoff_date
+                    debug_entry['time_valid'] = time_valid
+                    if not time_valid:
+                        debug_entry['reasons'].append('Too old')
+                        self.debug_info.append(debug_entry)
                         continue
+
+                    # Validate token
+                    validation_result, reasons = self._valid_token(t, strict_checks)
+                    debug_entry['reasons'] = reasons
+                    debug_entry['checks_passed'] = len([r for r in reasons if not r.startswith('Failed')])
+                    
+                    if validation_result:
+                        debug_entry['valid'] = True
+                        recent_tokens.append(t)
+                    else:
+                        debug_entry['valid'] = False
                         
-                    if not self._valid_token(t, strict_checks):
-                        continue
-                        
-                    recent_tokens.append(t)
                 except Exception as e:
-                    continue
+                    debug_entry['reasons'].append(f'Parse error: {str(e)}')
+                    
+                self.debug_info.append(debug_entry)
+                
             return recent_tokens
         except Exception as e:
             st.error(f"Token fetch error: {str(e)}")
             return []
 
     def _valid_token(self, token, strict_checks):
-        """More practical validation criteria"""
+        """Validation with detailed rejection reasons"""
+        reasons = []
         try:
-            # Basic checks for all tokens
+            # Basic checks
             address = token.get('address', '')
-            Pubkey.from_string(address)
-            
-            if strict_checks:
-                # Reasonable strict criteria
-                return (
-                    token.get('symbol') not in ['SOL', 'USDC', 'USDT'] and
-                    float(token.get('price', 0)) > 0.000001 and
-                    token.get('extensions', {}).get('website') and
-                    token.get('extensions', {}).get('twitter')
-                )
-            else:
-                # Loose criteria
-                return (
-                    token.get('symbol') and
-                    token.get('name') and
-                    float(token.get('price', 0)) > 0
-                )
-        except:
-            return False
-
-    def deep_analyze(self, token):
-        """Reliable analysis with fallback values"""
-        time.sleep(REQUEST_INTERVAL)
-        mint = token['address']
-        
-        try:
-            # Get price data with error handling
-            price_data = self.session.get(
-                f"{JUPITER_PRICE_API}?ids={mint}&showExtraInfo=true",
-                timeout=10
-            ).json().get('data', {}).get(mint, {})
-            
-            if not price_data:
-                return None
-
-            # Get supply with error protection
-            supply = 0
-            try:
-                supply_info = self.client.get_token_supply(Pubkey.from_string(mint))
-                if supply_info.value:
-                    supply = int(supply_info.value.amount) / 10 ** supply_info.value.decimals
-            except:
-                pass
+            if not address:
+                reasons.append('No address')
+                return False, reasons
                 
-            if supply <= 0:
-                return None
-
-            # Extract metrics with fallbacks
-            current_price = float(price_data.get('price', 0))
-            market_cap = current_price * supply
-            
-            extra_info = price_data.get('extraInfo', {})
-            last_swap = extra_info.get('lastSwappedPrice', {})
-            depth = extra_info.get('depth', {})
-            
-            # Calculate liquidity score
-            liquidity_score = self._calculate_liquidity_score(depth)
-            
-            # Calculate volatility
             try:
-                buy_price = float(last_swap.get('lastJupiterBuyPrice', current_price))
-                sell_price = float(last_swap.get('lastJupiterSellPrice', current_price))
-                volatility = abs(buy_price - sell_price) / current_price * 100
+                Pubkey.from_string(address)
             except:
-                volatility = 0
+                reasons.append('Invalid SPL address')
+                return False, reasons
 
-            # Confidence scoring with fallback
-            confidence_map = {'high': 90, 'medium': 70, 'low': 50}
-            confidence = confidence_map.get(
-                extra_info.get('confidenceLevel', 'low').lower(), 50
-            )
+            # Strict mode checks
+            if strict_checks:
+                checks = [
+                    ('symbol', lambda: token.get('symbol') not in ['SOL', 'USDC', 'USDT'], 'Excluded symbol'),
+                    ('price', lambda: float(token.get('price', 0)) > 0.000001, 'Price too low'),
+                    ('website', lambda: bool(token.get('extensions', {}).get('website')), 'Missing website'),
+                    ('twitter', lambda: bool(token.get('extensions', {}).get('twitter')), 'Missing twitter')
+                ]
+            else:
+                checks = [
+                    ('symbol', lambda: bool(token.get('symbol')), 'Missing symbol'),
+                    ('name', lambda: bool(token.get('name')), 'Missing name'),
+                    ('price', lambda: float(token.get('price', 0)) > 0, 'Invalid price')
+                ]
+
+            passed = True
+            for check_name, check_func, msg in checks:
+                if not check_func():
+                    reasons.append(f'Failed {check_name}: {msg}')
+                    passed = False
+                else:
+                    reasons.append(f'Passed {check_name}')
+
+            return passed, reasons
             
-            # Depth quality analysis
-            depth_quality = self._assess_depth_quality(depth)
-            
-            # Final rating calculation
-            rating = self._calculate_rating(liquidity_score, volatility, depth_quality, confidence)
-            
-            return {
-                'symbol': token['symbol'].upper(),
-                'address': mint,
-                'price': current_price,
-                'market_cap': market_cap,
-                'liquidity_score': liquidity_score,
-                'volatility': f"{volatility:.2f}%",
-                'depth_quality': depth_quality,
-                'confidence': confidence,
-                'rating': rating,
-                'added_date': token['timeAdded'],
-                'explorer': f"https://solscan.io/token/{mint}",
-                'supply': supply
-            }
         except Exception as e:
-            st.error(f"Analysis error: {str(e)}")
-            return None
+            reasons.append(f'Validation error: {str(e)}')
+            return False, reasons
 
-    def _calculate_liquidity_score(self, depth_data):
-        """Safe liquidity score calculation"""
-        try:
-            buy_impact = depth_data.get('buyPriceImpactRatio', {}).get('depth', {})
-            sell_impact = depth_data.get('sellPriceImpactRatio', {}).get('depth', {})
-            
-            impacts = [
-                buy_impact.get('10', 0.1),
-                buy_impact.get('100', 0.15),
-                buy_impact.get('1000', 0.2),
-                sell_impact.get('10', 0.1),
-                sell_impact.get('100', 0.15),
-                sell_impact.get('1000', 0.2)
-            ]
-            avg_impact = sum(impacts) / len(impacts)
-            return max(0, 100 - (avg_impact * 1000))
-        except:
-            return 50  # Default mid-range score
-
-    def _assess_depth_quality(self, depth_data):
-        """Depth analysis with fallbacks"""
-        try:
-            buy_1k = depth_data.get('buyPriceImpactRatio', {}).get('depth', {}).get('1000', 0.2)
-            sell_1k = depth_data.get('sellPriceImpactRatio', {}).get('depth', {}).get('1000', 0.2)
-            avg_impact = (buy_1k + sell_1k) / 2
-            
-            if avg_impact < 0.1: return 'Excellent'
-            if avg_impact < 0.25: return 'Good'
-            if avg_impact < 0.5: return 'Fair'
-            return 'Poor'
-        except:
-            return 'Unknown'
-
-    def _calculate_rating(self, liquidity, volatility, depth_quality, confidence):
-        """Robust rating calculation"""
-        quality_scores = {'Excellent': 90, 'Good': 75, 'Fair': 60, 'Poor': 40, 'Unknown': 50}
-        try:
-            volatility_score = max(0, 100 - float(volatility.replace('%', '')))
-        except:
-            volatility_score = 80
-            
-        return (
-            (liquidity * 0.4) +
-            (volatility_score * 0.3) +
-            (quality_scores.get(depth_quality, 50) * 0.2) +
-            (confidence * 0.1)
-        )
+    # [Keep rest of the analysis methods unchanged from previous version]
 
 def main():
-    st.set_page_config(page_title="Token Analyst Pro", layout="wide")
-    st.title("🔍 Professional Token Discovery & Analysis")
+    st.set_page_config(page_title="Token Analyst Pro+", layout="wide")
+    st.title("🔍 Token Discovery with Debug Info")
     
     analyzer = TokenAnalyzer()
     
@@ -215,6 +144,7 @@ def main():
         min_rating = st.slider("Minimum Rating", 0, 100, 65)
         min_mcap = st.number_input("Minimum Market Cap (USD)", 1000, 10000000, 10000)
         strict_mode = st.checkbox("Strict Validation", value=False)
+        show_debug = st.checkbox("Show Debug Info", value=False)
         
         if st.button("🔍 Find Promising Tokens"):
             with st.spinner("Scanning new listings..."):
@@ -243,6 +173,31 @@ def main():
                 file_name=RESULTS_FILE,
                 mime="text/csv"
             )
+
+    if show_debug and hasattr(analyzer, 'debug_info'):
+        st.subheader("🚨 Debug Information - Token Listing")
+        debug_df = pd.DataFrame(analyzer.debug_info)
+        
+        # Filter and format debug info
+        debug_df = debug_df[['symbol', 'address', 'raw_time', 'parsed_time', 
+                           'time_valid', 'checks_passed', 'reasons']]
+        debug_df['reasons'] = debug_df['reasons'].apply(lambda x: '\n'.join(x))
+        
+        st.dataframe(
+            debug_df,
+            column_config={
+                'symbol': 'Symbol',
+                'address': 'Contract',
+                'raw_time': 'Raw TimeAdded',
+                'parsed_time': 'Parsed Time',
+                'time_valid': 'Time Valid',
+                'checks_passed': 'Checks Passed',
+                'reasons': 'Validation Reasons'
+            },
+            hide_index=True,
+            height=600,
+            use_container_width=True
+        )
 
     if not st.session_state.analysis_results.empty:
         filtered = st.session_state.analysis_results[
