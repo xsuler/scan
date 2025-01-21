@@ -195,11 +195,8 @@ class AnalysisManager:
         # Create container and columns in separate contexts
         st.session_state.ui['container'] = st.empty()
         with st.session_state.ui['container']:
-            cols = st.columns([3, 1])
-            with cols[0]:
                 st.session_state.ui['progress'] = st.progress(0)
                 st.session_state.ui['status'] = st.empty()
-            with cols[1]:
                 st.session_state.ui['metrics'] = st.empty()
 
     def update_ui(self, token):
