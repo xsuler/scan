@@ -60,17 +60,18 @@ class TokenAnalyzer:
 
     def _valid_token(self, token, strict_checks):
         """Token validation with birdeye-trending requirement"""
-        reasons = []
-        return True, reasons 
+        reasons = [] 
         try:
             address = token.get('address', '')
             if not address:
                 reasons.append('No address')
+                st.error(1)
                 return False, reasons
                 
             try:
                 Pubkey.from_string(address)
             except:
+                st.error(2)
                 reasons.append('Invalid SPL address')
                 return False, reasons
 
@@ -94,6 +95,7 @@ class TokenAnalyzer:
                 if not check_func():
                     reasons.append(f'Failed {check_name}: {msg}')
                     passed = False
+                    st.error(3)
                 else:
                     reasons.append(f'Passed {check_name}')
 
