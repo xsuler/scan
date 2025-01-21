@@ -15,6 +15,7 @@ SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
 RESULTS_FILE = "token_analysis.csv"
 CHECKPOINT_FILE = "analysis_checkpoint.json"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+BATCH_SIZE = 3  # Process 3 tokens per iteration to prevent hanging
 
 class TokenAnalyzer:
     def __init__(self):
@@ -203,7 +204,8 @@ def main():
             'processed': 0,
             'total': 0,
             'results': [],
-            'params': None
+            'params': None,
+            'last_update': 0
         }
 
     with st.sidebar:
@@ -215,40 +217,46 @@ def main():
 
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("🔍 Start Analysis"):
-                checkpoint = load_checkpoint()
-                if checkpoint:
-                    st.session_state.analysis_state.update({
-                        'running': True,
-                        'processed': checkpoint['processed'],
-                        'total': checkpoint['total'],
-                        'results': checkpoint['results'],
-                        'params': checkpoint['params']
-                    })
-                else:
-                    tokens = analyzer.get_all_tokens(strict_checks=strict_mode)
-                    if not tokens:
-                        st.error("No tokens found. Try adjusting filters.")
-                        return
-                    
-                    st.session_state.analysis_state = {
-                        'running': True,
-                        'processed': 0,
-                        'total': len(tokens),
-                        'results': [],
-                        'params': {
-                            'min_mcap': min_mcap,
-                            'strict_mode': strict_mode,
-                            'tokens': tokens
-                        }
-                    }
-                    save_checkpoint(st.session_state.analysis_state)
-
+            start_btn = st.button("🔍 Start Analysis")
         with col2:
-            if st.button("⏹ Stop Analysis"):
-                st.session_state.analysis_state['running'] = False
-                clear_checkpoint()
-                st.rerun()
+            stop_btn = st.button("⏹ Stop Analysis")
+
+        if start_btn:
+            checkpoint = load_checkpoint()
+            if checkpoint and checkpoint.get('params'):
+                st.session_state.analysis_state.update({
+                    'running': True,
+                    'processed': checkpoint['processed'],
+                    'total': checkpoint['total'],
+                    'results': checkpoint['results'],
+                    'params': checkpoint['params'],
+                    'last_update': time.time()
+                })
+            else:
+                tokens = analyzer.get_all_tokens(strict_checks=strict_mode)
+                if not tokens:
+                    st.error("No tokens found. Try adjusting filters.")
+                    return
+                
+                st.session_state.analysis_state = {
+                    'running': True,
+                    'processed': 0,
+                    'total': len(tokens),
+                    'results': [],
+                    'params': {
+                        'min_mcap': min_mcap,
+                        'strict_mode': strict_mode,
+                        'tokens': tokens
+                    },
+                    'last_update': time.time()
+                }
+                save_checkpoint(st.session_state.analysis_state)
+            st.rerun()
+
+        if stop_btn:
+            st.session_state.analysis_state['running'] = False
+            clear_checkpoint()
+            st.rerun()
 
     # Analysis progress section
     if st.session_state.analysis_state['running']:
@@ -262,36 +270,42 @@ def main():
         min_mcap = state['params']['min_mcap']
         
         if state['processed'] < state['total']:
-            token = tokens[state['processed']]
-            try:
-                analysis = analyzer.deep_analyze(token)
-                if analysis and analysis['market_cap'] >= min_mcap:
-                    state['results'].append(analysis)
+            # Process in batches to prevent hanging
+            start_idx = state['processed']
+            end_idx = min(state['processed'] + BATCH_SIZE, state['total'])
+            
+            for idx in range(start_idx, end_idx):
+                token = tokens[idx]
+                try:
+                    analysis = analyzer.deep_analyze(token)
+                    if analysis and analysis['market_cap'] >= min_mcap:
+                        state['results'].append(analysis)
+                except Exception as e:
+                    error_container.error(f"Error processing {token.get('symbol', 'Unknown')}: {str(e)}")
+                finally:
+                    state['processed'] += 1
                 
-                state['processed'] += 1
                 progress = state['processed'] / state['total']
                 progress_bar.progress(progress)
                 
-                status_text.markdown(f"""
-                **Progress:** {state['processed']}/{state['total']} tokens  
-                **Valid Tokens Found:** {len(state['results'])}  
-                **Current Token:** {token.get('symbol', 'Unknown')} ({token['address'][:6]}...)
-                """)
-                
-                save_checkpoint(state)
-                time.sleep(0.1)  # Prevent UI freeze
-                st.rerun()
-                
-            except Exception as e:
-                error_container.error(f"Error processing token: {str(e)}")
-                state['processed'] += 1
-                save_checkpoint(state)
-                st.rerun()
+                # Update UI every 0.5 seconds max
+                if time.time() - state['last_update'] > 0.5:
+                    status_text.markdown(f"""
+                    **Progress:** {state['processed']}/{state['total']} tokens  
+                    **Valid Tokens Found:** {len(state['results'])}  
+                    **Current Token:** {token.get('symbol', 'Unknown')} ({token['address'][:6]}...)
+                    """)
+                    state['last_update'] = time.time()
+                    save_checkpoint(state)
+            
+            save_checkpoint(state)
+            st.rerun()
         else:
             st.session_state.analysis_state['running'] = False
             st.session_state.analysis_results = pd.DataFrame(state['results'])
             clear_checkpoint()
             st.success("✅ Analysis completed successfully!")
+            st.rerun()
 
     # Display results
     if not st.session_state.analysis_state['running'] and 'analysis_results' in st.session_state:
