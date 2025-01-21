@@ -188,43 +188,7 @@ class AnalysisManager:
                 'total_tokens': len(tokens)
             }
         }
-        self.create_ui()
         self.process_tokens(tokens)
-
-    def create_ui(self):
-        # Create container and columns in separate contexts
-        st.session_state.ui['container'] = st.empty()
-        with st.session_state.ui['container']:
-                st.session_state.ui['progress'] = st.progress(0)
-                st.session_state.ui['status'] = st.empty()
-                st.session_state.ui['metrics'] = st.empty()
-
-    def update_ui(self, token):
-        analysis = st.session_state.analysis
-        metrics = analysis['metrics']
-        elapsed = time.time() - metrics['start_time']
-        speed = analysis['progress'] / elapsed if elapsed > 0 else 0
-
-        with st.session_state.ui['container']:
-                st.session_state.ui['progress'].progress(
-                    analysis['progress'] / metrics['total_tokens']
-                )
-                status_text = f"""
-                **Current Token:** {token.get('symbol', 'Unknown')}  
-                **Address:** `{token['address'][:6]}...{token['address'][-4:]}`  
-                **Processed:** {analysis['progress']}/{metrics['total_tokens']}
-                """
-                st.session_state.ui['status'].markdown(status_text)
-            
-                metrics_text = f"""
-                ⚡ **Speed:** {speed:.1f}/sec  
-                ⏱️ **Elapsed:** {elapsed:.1f}s  
-                ✅ **Valid:** {len(analysis['results'])}  
-                📈 **Price:** ${self.analyzer.get_token_price(token):.4f}
-                """
-                st.session_state.ui['metrics'].markdown(metrics_text)
-
-        time.sleep(UI_REFRESH_INTERVAL)
 
     def process_tokens(self, tokens):
         for idx, token in enumerate(tokens):
@@ -236,8 +200,9 @@ class AnalysisManager:
                 st.session_state.analysis['results'].append(analysis)
 
             st.session_state.analysis['progress'] = idx + 1
-            self.update_ui(token)
             save_checkpoint()
+            time.sleep(UI_REFRESH_INTERVAL)
+            st.rerun()
 
         self.finalize_analysis()
 
@@ -245,13 +210,7 @@ class AnalysisManager:
         st.session_state.analysis['running'] = False
         st.session_state.results = pd.DataFrame(st.session_state.analysis['results'])
         clear_checkpoint()
-        self.cleanup_ui()
         st.rerun()
-
-    def cleanup_ui(self):
-        if st.session_state.ui['container']:
-            st.session_state.ui['container'].empty()
-            st.session_state.ui = {'container': None, 'progress': None}
 
 class UIManager:
     def __init__(self, analyzer):
@@ -261,7 +220,7 @@ class UIManager:
     def render_sidebar(self):
         with st.sidebar:
             st.image("https://jup.ag/svg/jupiter-logo.svg", width=200)
-            st.header("Analysis Parameters")
+            st.header("Analysis Controls")
             
             with st.expander("⚙️ Core Settings", expanded=True):
                 params = {
@@ -291,6 +250,39 @@ class UIManager:
                 st.session_state.clear()
                 st.rerun()
 
+            if st.session_state.analysis.get('running', False):
+                self.render_progress()
+                self.render_current_token()
+
+    def render_progress(self):
+        analysis = st.session_state.analysis
+        metrics = analysis['metrics']
+        progress = analysis['progress'] / metrics['total_tokens']
+        elapsed = time.time() - metrics['start_time']
+        
+        st.progress(progress)
+        st.metric("Processed Tokens", f"{analysis['progress']}/{metrics['total_tokens']}")
+        st.metric("Analysis Speed", f"{(analysis['progress']/elapsed):.1f} tkn/s" if elapsed > 0 else "N/A")
+        st.metric("Elapsed Time", f"{elapsed:.1f}s")
+
+    def render_current_token(self):
+        if st.session_state.analysis['results']:
+            token = st.session_state.analysis['results'][-1]
+            with st.expander("Current Token Details", expanded=True):
+                cols = st.columns([1, 3])
+                with cols[0]:
+                    st.image(token.get('logoURI', 'https://via.placeholder.com/80'), width=60)
+                with cols[1]:
+                    st.subheader(f"{token['symbol']}")
+                    st.caption(f"`{token['address'][:6]}...{token['address'][-4:]}`")
+                
+                st.markdown(f"""
+                **Price:** ${token['price']:.4f}  
+                **Market Cap:** ${token['market_cap']:,.0f}  
+                **Rating:** {token['rating']:.1f}/100  
+                **Volume (24h):** ${token['volume']:,.0f}
+                """)
+
     def start_analysis(self, params):
         if checkpoint := load_checkpoint():
             self.manager.start_analysis(checkpoint['params']['tokens'], params)
@@ -307,39 +299,22 @@ class UIManager:
         st.rerun()
 
     def render_main(self):
-        st.title("🪙 Solana Token Analysis Suite")
+        st.title("Real-time Solana Token Analysis")
         
-        if st.session_state.analysis.get('running', False):
-            self.render_live_dashboard()
-        else:
+        if st.session_state.get('results') is not None:
             self.render_results()
-            self.render_debug_info()
-
-    def render_live_dashboard(self):
-        with st.expander("📈 Real-time Metrics", expanded=True):
-            cols = st.columns(4)
-            metrics = st.session_state.analysis['metrics']
-            cols[0].metric("Tokens Analyzed", st.session_state.analysis['progress'])
-            cols[1].metric("Valid Tokens", len(st.session_state.analysis['results']))
-            cols[2].metric("Avg Speed", f"{metrics['speed']:.1f} tkn/s")
-            cols[3].metric("Elapsed Time", f"{time.time() - metrics['start_time']:.1f}s")
-
-        with st.expander("🔍 Live Token Preview"):
-            if st.session_state.analysis['results']:
-                self.render_token_card(st.session_state.analysis['results'][-1])
+            
+        if st.session_state.analysis.get('running', False):
+            st.experimental_rerun()
 
     def render_results(self):
-        if hasattr(st.session_state, 'results') and not st.session_state.results.empty:
-            tab1, tab2, tab3 = st.tabs(["📋 Results Table", "📈 Market Overview", "📤 Export Data"])
-            
-            with tab1:
-                self.render_results_table()
-            
-            with tab2:
-                self.render_market_charts()
-            
-            with tab3:
-                self.render_export_section()
+        tab1, tab2 = st.tabs(["Analysis Results", "Market Overview"])
+        
+        with tab1:
+            self.render_results_table()
+        
+        with tab2:
+            self.render_market_charts()
 
     def render_results_table(self):
         df = st.session_state.results.sort_values('rating', ascending=False)
@@ -373,49 +348,6 @@ class UIManager:
                              title="Liquidity Distribution")
             st.plotly_chart(fig, use_container_width=True)
 
-    def render_export_section(self):
-        st.download_button(
-            "💾 Download CSV Report",
-            data=st.session_state.results.to_csv(index=False),
-            file_name=RESULTS_FILE,
-            mime="text/csv"
-        )
-        
-        json_data = st.session_state.results.to_json(orient='records')
-        st.download_button(
-            "📥 Download JSON Data",
-            data=json_data,
-            file_name="token_analysis.json",
-            mime="application/json"
-        )
-
-    def render_token_card(self, token):
-        cols = st.columns([1, 3])
-        with cols[0]:
-            st.image(token.get('logoURI', 'https://via.placeholder.com/80'), width=80)
-        
-        with cols[1]:
-            st.subheader(f"{token['symbol']}")
-            st.markdown(f"**Price:** ${token['price']:.4f} | **MCap:** ${token['market_cap']:,.0f}")
-            st.progress(token['rating']/100, f"Rating: {token['rating']:.1f}/100")
-            
-        st.markdown(f"""
-        - **Liquidity Score:** {token['liquidity']:.1f}
-        - **24h Volume:** ${token['volume']:,.0f}
-        - **Token Age:** {token['age']:.1f} days
-        - [Explorer Link]({token['explorer']})
-        """)
-
-    def render_debug_info(self):
-        if st.session_state.get('show_debug', False):
-            with st.expander("🔧 Debug Information"):
-                debug_df = pd.DataFrame(self.analyzer.debug_info)
-                st.dataframe(
-                    debug_df[['symbol', 'address', 'valid', 'reasons']],
-                    column_config={"reasons": "Validation Issues"},
-                    height=300
-                )
-
 def save_checkpoint():
     data = {
         'params': st.session_state.analysis['params'],
@@ -443,4 +375,3 @@ if __name__ == "__main__":
     ui = UIManager(analyzer)
     ui.render_sidebar()
     ui.render_main()
-    st.session_state.setdefault('show_debug', False)
