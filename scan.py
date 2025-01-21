@@ -25,6 +25,7 @@ class TokenAnalyzer:
         self.debug_info = []
         try:
             response = self.session.get(JUPITER_TOKEN_LIST, timeout=15)
+            response.raise_for_status()
             tokens = response.json()
             return [t for t in tokens if self.validate_token(t, strict_checks)]
         except Exception as e:
@@ -71,7 +72,9 @@ class TokenAnalyzer:
     def analyze_token(self, token):
         try:
             price_data = self.get_token_price_data(token)
-            
+            if not price_data:
+                return None
+                
             analysis = {
                 'symbol': token.get('symbol', 'Unknown'),
                 'address': token['address'],
@@ -98,22 +101,26 @@ class TokenAnalyzer:
         try:
             decimals = token.get('decimals', 9)
             amount = int(1000 * (10 ** decimals))
-            quote = self.session.get(
+            response = self.session.get(
                 f"{JUPITER_QUOTE_API}?inputMint={token['address']}&outputMint={USDC_MINT}&amount={amount}",
                 timeout=15
-            ).json()
+            )
+            response.raise_for_status()
+            quote = response.json()
             return max(0.0, 100.0 - (float(quote.get('priceImpactPct', 1)) * 10000))
-        except:
+        except Exception as e:
+            print(f"Liquidity calculation error: {str(e)}")
             return 0.0
 
     def calculate_rating(self, analysis):
         try:
             liquidity_score = analysis['liquidity'] * 0.4
-            price_stability = (1 - abs(analysis['buy_price'] - analysis['sell_price'])/analysis['price']) * 0.3
+            price_stability = (1 - abs(analysis['buy_price'] - analysis['sell_price'])/analysis['price']) * 0.3 if analysis['price'] != 0 else 0
             market_depth = (1 - (analysis['price_impact_10'] + analysis['price_impact_100'])/2) * 0.3
             
             return min(100.0, (liquidity_score + price_stability + market_depth) * 100)
-        except:
+        except KeyError as e:
+            print(f"Missing key in rating calculation: {str(e)}")
             return 0.0
 
     def get_token_price_data(self, token):
@@ -125,8 +132,10 @@ class TokenAnalyzer:
             response.raise_for_status()
             data = response.json()
             price_data = data.get('data', {}).get(token['address'], {})
+            if not price_data:
+                return None
+                
             extra_info = price_data.get('extraInfo', {})
-            
             return {
                 'price': price_data.get('price', 0),
                 'type': price_data.get('type', 'N/A'),
@@ -147,8 +156,8 @@ class TokenAnalyzer:
                                     .get('lastJupiterSellPrice', 0)
             }
         except Exception as e:
-            print(f"Price error for {token['symbol']}: {str(e)}")
-            return {}
+            print(f"Price data error: {str(e)}")
+            return None
 
 class AnalysisManager:
     def __init__(self, analyzer):
@@ -199,15 +208,20 @@ class AnalysisManager:
             token = tokens[idx]
             analysis = self.analyzer.analyze_token(token)
             
-            st.session_state.analysis['current_token'] = token
-            st.session_state.analysis['current_analysis'] = analysis
-            
-            if analysis and analysis['rating'] >= st.session_state.analysis['params']['min_rating']:
-                st.session_state.analysis['results'].append(analysis)
+            # Only update current analysis if successful
+            if analysis:
+                st.session_state.analysis['current_token'] = token
+                st.session_state.analysis['current_analysis'] = analysis
+                
+                if analysis['rating'] >= st.session_state.analysis['params']['min_rating']:
+                    st.session_state.analysis['results'].append(analysis)
 
+            # Always update progress
             st.session_state.analysis['progress'] = idx + 1
             st.session_state.analysis['current_index'] += 1
-            st.session_state.analysis['metrics']['speed'] = (idx + 1) / (time.time() - st.session_state.analysis['metrics']['start_time'])
+            st.session_state.analysis['metrics']['speed'] = (idx + 1) / (
+                time.time() - st.session_state.analysis['metrics']['start_time']
+            )
             
             time.sleep(UI_REFRESH_INTERVAL)
             st.rerun()
@@ -216,7 +230,10 @@ class AnalysisManager:
 
     def finalize_analysis(self):
         st.session_state.analysis['running'] = False
-        st.session_state.results = pd.DataFrame(st.session_state.analysis['results'])
+        if st.session_state.analysis['results']:
+            st.session_state.results = pd.DataFrame(st.session_state.analysis['results'])
+        else:
+            st.session_state.results = pd.DataFrame()
 
 class UIManager:
     def __init__(self, analyzer):
@@ -258,7 +275,7 @@ class UIManager:
         progress = analysis['progress'] / metrics['total_tokens']
         elapsed = time.time() - metrics['start_time']
         
-        st.progress(progress)
+        st.progress(min(progress, 1.0))
         st.metric("Processed Tokens", f"{analysis['progress']}/{metrics['total_tokens']}")
         st.metric("Analysis Speed", f"{(analysis['progress']/elapsed):.1f} tkn/s" if elapsed > 0 else "N/A")
         st.metric("Elapsed Time", f"{elapsed:.1f}s")
@@ -268,7 +285,7 @@ class UIManager:
         current_token = analysis_state.get('current_token')
         current_analysis = analysis_state.get('current_analysis')
 
-        if not current_token:
+        if not current_token or not current_analysis:
             return
 
         with st.expander("Current Token Details", expanded=True):
@@ -282,12 +299,14 @@ class UIManager:
             with cols[0]:
                 st.metric("Current Price", f"${current_analysis.get('price', 0):.4f}")
                 st.metric("Buy Price", f"${current_analysis.get('buy_price', 0):.4f}")
-                st.metric("Price Impact (10)", f"{current_analysis.get('price_impact_10', 0)*100:.2f}%")
+                st.metric("Price Impact (10)", 
+                         f"{current_analysis.get('price_impact_10', 0)*100:.2f}%")
                 
             with cols[1]:
                 st.metric("Confidence Level", current_analysis.get('confidence', 'N/A'))
                 st.metric("Sell Price", f"${current_analysis.get('sell_price', 0):.4f}")
-                st.metric("Price Impact (100)", f"{current_analysis.get('price_impact_100', 0)*100:.2f}%")
+                st.metric("Price Impact (100)", 
+                         f"{current_analysis.get('price_impact_100', 0)*100:.2f}%")
 
     def start_analysis(self, params):
         tokens = self.analyzer.get_all_tokens(params['strict_mode'])
@@ -320,6 +339,10 @@ class UIManager:
                 self.render_price_analysis()
 
     def render_results_table(self):
+        if st.session_state.results.empty:
+            st.warning("No tokens matching the criteria found")
+            return
+            
         df = st.session_state.results.sort_values('rating', ascending=False)
         st.dataframe(
             df,
@@ -337,6 +360,9 @@ class UIManager:
         )
 
     def render_market_depth_charts(self):
+        if st.session_state.results.empty:
+            return
+            
         df = st.session_state.results
         col1, col2 = st.columns(2)
         
@@ -353,6 +379,9 @@ class UIManager:
             st.plotly_chart(fig, use_container_width=True)
 
     def render_price_analysis(self):
+        if st.session_state.results.empty:
+            return
+            
         df = st.session_state.results
         fig = px.scatter_3d(df, x='price', y='buy_price', z='sell_price',
                           color='rating', hover_name='symbol',
