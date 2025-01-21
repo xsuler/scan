@@ -82,8 +82,8 @@ class TokenAnalyzer:
                 if not check_func():
                     reasons.append(f'Failed {check_name}: {msg}')
                     passed = False
-                    st.error(3)
                 else:
+                    st.error(3)
                     reasons.append(f'Passed {check_name}')
 
             return passed, reasons
