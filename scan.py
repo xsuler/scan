@@ -14,8 +14,8 @@ JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 UI_REFRESH_INTERVAL = 0.01
-ROW_HEIGHT = 35  # 每行高度（像素）
-HEADER_HEIGHT = 50  # 表头高度（像素）
+ROW_HEIGHT = 35
+HEADER_HEIGHT = 50
 
 class TokenAnalyzer:
     def __init__(self):
@@ -158,7 +158,7 @@ class TokenAnalyzer:
             )
             
             final_score = (raw_score - penalties) * 100
-            return np.clip(final_score, 0, 100)
+            return final_score  # 移除分数限制
             
         except KeyError as e:
             print(f"Missing key in score calculation: {str(e)}")
@@ -262,35 +262,56 @@ class UIManager:
     def __init__(self, analyzer):
         self.analyzer = analyzer
         self.manager = AnalysisManager(analyzer)
-        self.inject_css()
+        self.inject_responsive_css()
 
-    def inject_css(self):
-        """注入自定义CSS实现侧边栏全屏展示"""
+    def inject_responsive_css(self):
+        """响应式布局适配"""
         st.markdown("""
         <style>
+            /* 强制侧边栏全屏显示 */
+            section[data-testid="stSidebar"] {
+                width: 100% !important;
+                min-width: 100% !important;
+                transform: translateX(0) !important;
+                z-index: 999999;
+            }
+
             /* 隐藏折叠按钮 */
             [data-testid="collapsedControl"] {
                 display: none !important;
             }
-            
-            /* 设置侧边栏宽度为100% */
-            section[data-testid="stSidebar"] {
-                width: 100% !important;
-                min-width: 100% !important;
-            }
 
             /* 主内容区适配 */
-            .stApp {
-                flex-direction: column;
+            .main .block-container {
+                padding-top: 2rem;
+                position: relative;
+                z-index: 1;
             }
 
-            /* 移动端适配 */
+            /* 移动端按钮适配 */
             @media (max-width: 768px) {
-                section[data-testid="stSidebar"] {
+                /* 按钮容器 */
+                div.stButton > button {
+                    width: 100% !important;
+                    margin: 8px 0 !important;
+                }
+                
+                /* 两列布局改为堆叠 */
+                div[data-testid="column"] {
+                    flex: 0 0 100% !important;
                     width: 100% !important;
                 }
-                div[data-testid="stVerticalBlock"] {
-                    padding: 0 1rem;
+                
+                /* 表格优化 */
+                div[data-testid="stDataFrame"] {
+                    font-size: 14px;
+                }
+            }
+
+            /* 桌面端按钮间距 */
+            @media (min-width: 769px) {
+                div[data-testid="stHorizontalBlock"] {
+                    gap: 1rem;
                 }
             }
         </style>
@@ -307,18 +328,19 @@ class UIManager:
                     'live_sorting': st.checkbox("Real-time Sorting", True)
                 }
 
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("🚀 Start Analysis", use_container_width=True):
-                    self.start_analysis(params)
-            with col2:
-                if st.button("⏹ Stop Analysis", use_container_width=True):
-                    st.session_state.analysis['running'] = False
-
-            st.divider()
-            if st.button("🧹 Clear Results", use_container_width=True):
-                st.session_state.live_results = pd.DataFrame()
-                st.rerun()
+            # 按钮容器使用弹性布局
+            with st.container():
+                cols = st.columns([1, 1, 1])  # 三列布局
+                with cols[0]:
+                    if st.button("🚀 Start", use_container_width=True, help="开始分析"):
+                        self.start_analysis(params)
+                with cols[1]:
+                    if st.button("⏹ Stop", use_container_width=True, help="停止分析"):
+                        st.session_state.analysis['running'] = False
+                with cols[2]:
+                    if st.button("🧹 Clear", use_container_width=True, help="清除结果"):
+                        st.session_state.live_results = pd.DataFrame()
+                        st.rerun()
 
             if st.session_state.analysis.get('running', False):
                 self.render_progress()
@@ -371,9 +393,7 @@ class UIManager:
         df = st.session_state.live_results
         
         # 动态排序和列顺序调整
-        sort_column = 'score'
-        sort_ascending = False
-        sorted_df = df.sort_values(by=sort_column, ascending=sort_ascending)
+        sorted_df = df.sort_values(by='score', ascending=False)
         
         # 调整列顺序（score第一列）
         sorted_df = sorted_df[['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer']]
@@ -385,7 +405,7 @@ class UIManager:
             column_config={
                 'score': st.column_config.NumberColumn(
                     'Score',
-                    help="综合评分 (0-100)",
+                    help="综合评分",
                     format="%.1f",
                     width='small'
                 ),
