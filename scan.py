@@ -328,7 +328,7 @@ class UIManager:
             
             Rating: {rating:.1f}/100  
             
-            Volume (24h):** ${volume:,.0f}
+            Volume (24h): ${volume:,.0f}
             """)
 
     def start_analysis(self, params):
