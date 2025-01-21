@@ -184,13 +184,24 @@ class TokenAnalyzer:
             return 0
 
 def save_checkpoint(data):
+    """Save checkpoint with serializable data only"""
+    serializable_data = {
+        'running': data['running'],
+        'results': data['results'],
+        'params': data['params'],
+        'processed': data['processed'],
+        'total': data['total']
+    }
     with open(CHECKPOINT_FILE, 'w') as f:
-        json.dump(data, f)
+        json.dump(serializable_data, f)
 
 def load_checkpoint():
     if os.path.exists(CHECKPOINT_FILE):
         with open(CHECKPOINT_FILE, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
+            # Recreate generator state from params
+            data['current_batch'] = []
+            return data
     return None
 
 def clear_checkpoint():
@@ -201,11 +212,12 @@ def initialize_session_state():
     required_keys = {
         'analysis': {
             'running': False,
-            'generator': None,
             'results': [],
             'params': None,
             'processed': 0,
-            'total': 0
+            'total': 0,
+            'current_batch': [],
+            'generator': None
         },
         'analysis_results': pd.DataFrame()
     }
@@ -230,17 +242,18 @@ def main():
 
         def start_analysis():
             checkpoint = load_checkpoint()
-            if checkpoint and 'params' in checkpoint:
+            if checkpoint:
+                # Recreate generator from checkpoint data
                 st.session_state.analysis = {
                     'running': True,
-                    'generator': analyzer.analyze_generator(
-                        checkpoint['params']['tokens'],
-                        checkpoint['params']['min_mcap']
-                    ),
-                    'results': checkpoint.get('results', []),
+                    'results': checkpoint['results'],
                     'params': checkpoint['params'],
-                    'processed': checkpoint.get('processed', 0),
-                    'total': checkpoint.get('total', 0)
+                    'processed': checkpoint['processed'],
+                    'total': checkpoint['total'],
+                    'generator': analyzer.analyze_generator(
+                        checkpoint['params']['tokens'][checkpoint['processed']:],
+                        checkpoint['params']['min_mcap']
+                    )
                 }
             else:
                 tokens = analyzer.get_all_tokens(strict_checks=strict_mode)
@@ -280,9 +293,9 @@ def main():
         status_text = st.empty()
         
         try:
-            if 'generator' in st.session_state.analysis and st.session_state.analysis['generator']:
+            if st.session_state.analysis['generator']:
                 batch_result = next(st.session_state.analysis['generator'])
-                st.session_state.analysis['processed'] = batch_result['processed']
+                st.session_state.analysis['processed'] += batch_result['processed']
                 st.session_state.analysis['results'].extend(batch_result['results'])
                 
                 progress = st.session_state.analysis['processed'] / st.session_state.analysis['total']
