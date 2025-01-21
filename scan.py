@@ -242,7 +242,8 @@ def initialize_session_state():
             'processed': 0,
             'total': 0
         },
-        'analysis_results': pd.DataFrame()
+        'analysis_results': pd.DataFrame(),
+        'progress_initialized': False
     }
     
     for key, default_value in required_keys.items():
@@ -267,7 +268,6 @@ def main():
             checkpoint = load_checkpoint()
             if checkpoint:
                 try:
-                    # Validate token list integrity
                     if len(checkpoint['params']['tokens']) != checkpoint['total']:
                         raise ValueError("Token list mismatch")
                         
@@ -311,7 +311,7 @@ def main():
         def stop_analysis():
             st.session_state.analysis['running'] = False
             clear_checkpoint()
-            
+            st.session_state.progress_initialized = False
 
         col1, col2 = st.columns(2)
         with col1:
@@ -321,14 +321,19 @@ def main():
 
     # Analysis progress handling
     if st.session_state.analysis.get('running', False):
-        st.subheader("Analysis Progress")
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        if not st.session_state.progress_initialized:
+            st.subheader("Analysis Progress")
+            st.session_state.progress_bar = st.progress(0)
+            st.session_state.status_text = st.empty()
+            st.session_state.progress_initialized = True
+
+        progress_bar = st.session_state.progress_bar
+        status_text = st.session_state.status_text
         
         try:
             if st.session_state.analysis['generator']:
                 batch_result = next(st.session_state.analysis['generator'])
-                st.session_state.analysis['processed'] += batch_result['processed']
+                st.session_state.analysis['processed'] = batch_result['processed']
                 st.session_state.analysis['results'].extend(batch_result['results'])
                 
                 progress = st.session_state.analysis['processed'] / st.session_state.analysis['total']
@@ -342,18 +347,21 @@ def main():
                 """)
                 
                 save_checkpoint(st.session_state.analysis)
+                time.sleep(0.05)  # Smooth out UI updates
                 st.rerun()
                 
         except StopIteration:
             st.session_state.analysis['running'] = False
             st.session_state.analysis_results = pd.DataFrame(st.session_state.analysis['results'])
             clear_checkpoint()
+            st.session_state.progress_initialized = False
             st.success("✅ Analysis completed!")
             st.rerun()
         except Exception as e:
             st.error(f"Analysis failed: {str(e)}")
             st.session_state.analysis['running'] = False
             clear_checkpoint()
+            st.session_state.progress_initialized = False
             st.rerun()
 
     # Display results
