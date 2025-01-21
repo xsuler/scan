@@ -15,7 +15,7 @@ SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
 RESULTS_FILE = "token_analysis.csv"
 CHECKPOINT_FILE = "analysis_checkpoint.json"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-BATCH_SIZE = 3  # Process 3 tokens per iteration to prevent hanging
+BATCH_SIZE = 5  # Tokens per batch
 
 class TokenAnalyzer:
     def __init__(self):
@@ -27,7 +27,7 @@ class TokenAnalyzer:
         self.debug_info = []
         
     def get_all_tokens(self, strict_checks=True):
-        """Get all tokens with validation"""
+        """Get validated tokens with debug info"""
         self.debug_info = []
         try:
             response = self.session.get(JUPITER_TOKEN_LIST, timeout=15)
@@ -63,7 +63,7 @@ class TokenAnalyzer:
             return []
 
     def _valid_token(self, token, strict_checks):
-        """Token validation with birdeye-trending requirement"""
+        """Validate token against criteria"""
         reasons = [] 
         try:
             address = token.get('address', '')
@@ -109,10 +109,34 @@ class TokenAnalyzer:
             reasons.append(f'Validation error: {str(e)}')
             return False, reasons
 
+    def analyze_generator(self, tokens, min_mcap):
+        """Generator function for batch processing"""
+        results = []
+        processed = 0
+        total = len(tokens)
+        
+        for idx, token in enumerate(tokens):
+            try:
+                analysis = self.deep_analyze(token)
+                if analysis and analysis['market_cap'] >= min_mcap:
+                    results.append(analysis)
+            except Exception as e:
+                st.error(f"Skipping {token.get('symbol')}: {str(e)}")
+            
+            processed = idx + 1
+            if (idx + 1) % BATCH_SIZE == 0 or processed == total:
+                yield {
+                    'processed': processed,
+                    'total': total,
+                    'results': results,
+                    'current_token': token
+                }
+                results = []  # Reset batch
+
     def deep_analyze(self, token):
-        """Perform comprehensive token analysis"""
+        """Comprehensive token analysis"""
         try:
-            analysis = {
+            return {
                 'symbol': token.get('symbol', 'Unknown'),
                 'address': token['address'],
                 'price': float(token.get('price', 0)),
@@ -122,13 +146,11 @@ class TokenAnalyzer:
                 'explorer': f"https://solscan.io/token/{token['address']}",
                 'supply': self._get_circulating_supply(token)
             }
-            return analysis
         except Exception as e:
-            st.error(f"Analysis failed for {token.get('symbol')}: {str(e)}")
-            return None
+            raise RuntimeError(f"Analysis failed: {str(e)}") from e
 
     def _estimate_market_cap(self, token):
-        """Market cap estimation using circulating supply"""
+        """Calculate market cap"""
         try:
             supply = self._get_circulating_supply(token)
             return supply * float(token.get('price', 0))
@@ -136,40 +158,32 @@ class TokenAnalyzer:
             return 0
 
     def _calculate_liquidity(self, token):
-        """Liquidity scoring using Jupiter swap simulation"""
+        """Calculate liquidity score"""
         try:
             input_mint = token['address']
             decimals = token.get('decimals', 9)
-            amount = int(1000 * (10 ** decimals))  # Simulate 1000 token swap
+            amount = int(1000 * (10 ** decimals))
             
             quote_url = f"https://quote-api.jup.ag/v6/quote?inputMint={input_mint}&outputMint={USDC_MINT}&amount={amount}"
             response = self.session.get(quote_url, timeout=15)
             quote = response.json()
             
             price_impact = float(quote.get('priceImpactPct', 1))
-            return max(0, 100 - (price_impact * 10000))  # Convert impact to liquidity score
+            return max(0, 100 - (price_impact * 10000))
         except:
             return 0
 
     def _calculate_rating(self, token):
-        """Composite rating system"""
+        """Calculate composite rating"""
         try:
-            score = 0
             liquidity = self._calculate_liquidity(token)
             mcap = self._estimate_market_cap(token)
-            
-            # Liquidity component (0-60)
-            score += liquidity * 0.6
-            
-            # Market cap component (0-40)
-            score += 40 * (1 / (1 + (mcap / 1e6)))  # Inverse scaling
-            
-            return min(100, max(0, round(score, 2)))
+            return min(100, max(0, round((liquidity * 0.6) + (40 * (1 / (1 + (mcap / 1e6)))), 2)))
         except:
             return 0
 
     def _get_circulating_supply(self, token):
-        """Get circulating supply from chain"""
+        """Get supply from chain"""
         try:
             mint_address = Pubkey.from_string(token['address'])
             account_info = self.client.get_account_info_json_parsed(mint_address).value
@@ -198,14 +212,14 @@ def main():
     analyzer = TokenAnalyzer()
 
     # Initialize session state
-    if 'analysis_state' not in st.session_state:
-        st.session_state.analysis_state = {
+    if 'analysis' not in st.session_state:
+        st.session_state.analysis = {
             'running': False,
-            'processed': 0,
-            'total': 0,
+            'generator': None,
             'results': [],
             'params': None,
-            'last_update': 0
+            'processed': 0,
+            'total': 0
         }
 
     with st.sidebar:
@@ -215,100 +229,91 @@ def main():
         strict_mode = st.checkbox("Strict Validation", value=True)
         show_debug = st.checkbox("Show Debug Info", value=False)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            start_btn = st.button("🔍 Start Analysis")
-        with col2:
-            stop_btn = st.button("⏹ Stop Analysis")
-
-        if start_btn:
+        def start_analysis():
             checkpoint = load_checkpoint()
-            if checkpoint and checkpoint.get('params'):
-                st.session_state.analysis_state.update({
+            if checkpoint:
+                st.session_state.analysis.update({
                     'running': True,
                     'processed': checkpoint['processed'],
                     'total': checkpoint['total'],
                     'results': checkpoint['results'],
                     'params': checkpoint['params'],
-                    'last_update': time.time()
+                    'generator': analyzer.analyze_generator(
+                        checkpoint['params']['tokens'],
+                        checkpoint['params']['min_mcap']
+                    )
                 })
             else:
                 tokens = analyzer.get_all_tokens(strict_checks=strict_mode)
                 if not tokens:
-                    st.error("No tokens found. Try adjusting filters.")
+                    st.error("No tokens found")
                     return
                 
-                st.session_state.analysis_state = {
+                st.session_state.analysis = {
                     'running': True,
-                    'processed': 0,
-                    'total': len(tokens),
+                    'generator': analyzer.analyze_generator(tokens, min_mcap),
                     'results': [],
                     'params': {
                         'min_mcap': min_mcap,
                         'strict_mode': strict_mode,
                         'tokens': tokens
                     },
-                    'last_update': time.time()
+                    'processed': 0,
+                    'total': len(tokens)
                 }
-                save_checkpoint(st.session_state.analysis_state)
-            st.rerun()
+            save_checkpoint(st.session_state.analysis)
 
-        if stop_btn:
-            st.session_state.analysis_state['running'] = False
+        def stop_analysis():
+            st.session_state.analysis['running'] = False
             clear_checkpoint()
             st.rerun()
 
-    # Analysis progress section
-    if st.session_state.analysis_state['running']:
+        st.button("🔍 Start Analysis", on_click=start_analysis)
+        st.button("⏹ Stop Analysis", on_click=stop_analysis)
+
+    # Analysis progress handling
+    if st.session_state.analysis['running']:
         st.subheader("Analysis Progress")
         progress_bar = st.progress(0)
         status_text = st.empty()
-        error_container = st.container()
         
-        state = st.session_state.analysis_state
-        tokens = state['params']['tokens']
-        min_mcap = state['params']['min_mcap']
-        
-        if state['processed'] < state['total']:
-            # Process in batches to prevent hanging
-            start_idx = state['processed']
-            end_idx = min(state['processed'] + BATCH_SIZE, state['total'])
+        try:
+            # Process next batch
+            batch_result = next(st.session_state.analysis['generator'])
+            st.session_state.analysis['processed'] = batch_result['processed']
+            st.session_state.analysis['results'].extend(batch_result['results'])
             
-            for idx in range(start_idx, end_idx):
-                token = tokens[idx]
-                try:
-                    analysis = analyzer.deep_analyze(token)
-                    if analysis and analysis['market_cap'] >= min_mcap:
-                        state['results'].append(analysis)
-                except Exception as e:
-                    error_container.error(f"Error processing {token.get('symbol', 'Unknown')}: {str(e)}")
-                finally:
-                    state['processed'] += 1
-                
-                progress = state['processed'] / state['total']
-                progress_bar.progress(progress)
-                
-                # Update UI every 0.5 seconds max
-                if time.time() - state['last_update'] > 0.5:
-                    status_text.markdown(f"""
-                    **Progress:** {state['processed']}/{state['total']} tokens  
-                    **Valid Tokens Found:** {len(state['results'])}  
-                    **Current Token:** {token.get('symbol', 'Unknown')} ({token['address'][:6]}...)
-                    """)
-                    state['last_update'] = time.time()
-                    save_checkpoint(state)
+            # Update progress
+            progress = st.session_state.analysis['processed'] / st.session_state.analysis['total']
+            progress_bar.progress(progress)
             
-            save_checkpoint(state)
+            # Update status
+            status_text.markdown(f"""
+            **Progress:** {st.session_state.analysis['processed']}/{st.session_state.analysis['total']}  
+            **Valid Tokens:** {len(st.session_state.analysis['results'])}  
+            **Current Token:** {batch_result['current_token'].get('symbol', 'Unknown')} 
+            ({batch_result['current_token']['address'][:6]}...)
+            """)
+            
+            # Save checkpoint and rerun
+            save_checkpoint({
+                'processed': st.session_state.analysis['processed'],
+                'total': st.session_state.analysis['total'],
+                'results': st.session_state.analysis['results'],
+                'params': st.session_state.analysis['params']
+            })
             st.rerun()
-        else:
-            st.session_state.analysis_state['running'] = False
-            st.session_state.analysis_results = pd.DataFrame(state['results'])
+            
+        except StopIteration:
+            # Analysis complete
+            st.session_state.analysis['running'] = False
+            st.session_state.analysis_results = pd.DataFrame(st.session_state.analysis['results'])
             clear_checkpoint()
-            st.success("✅ Analysis completed successfully!")
+            st.success("✅ Analysis completed!")
             st.rerun()
 
     # Display results
-    if not st.session_state.analysis_state['running'] and 'analysis_results' in st.session_state:
+    if not st.session_state.analysis['running'] and 'analysis_results' in st.session_state:
         filtered = st.session_state.analysis_results[
             st.session_state.analysis_results['rating'] >= min_rating
         ].sort_values('rating', ascending=False)
