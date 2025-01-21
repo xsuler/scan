@@ -12,9 +12,8 @@ from urllib3.util.retry import Retry
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 SOLANA_RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
-RESULTS_FILE = "promising_tokens.csv"
+RESULTS_FILE = "token_analysis.csv"
 REQUEST_INTERVAL = 0.5  # 500ms between requests
-ANALYSIS_DAYS = 3
 
 class TokenAnalyzer:
     def __init__(self):
@@ -24,10 +23,10 @@ class TokenAnalyzer:
                       status_forcelist=[502, 503, 504])
         self.session.mount('https://', HTTPAdapter(max_retries=retries))
         
-    def get_recent_tokens(self):
-        """Get tokens added in last 3 days with verification"""
+    def get_recent_tokens(self, days=3, strict_checks=True):
+        """Get tokens added in specified days with optional validation"""
         try:
-            cutoff_date = datetime.now() - timedelta(days=ANALYSIS_DAYS)
+            cutoff_date = datetime.now() - timedelta(days=days)
             response = self.session.get(JUPITER_TOKEN_LIST, timeout=15)
             tokens = response.json()
             
@@ -35,7 +34,7 @@ class TokenAnalyzer:
             for t in tokens:
                 try:
                     added_date = datetime.fromisoformat(t['timeAdded'].rstrip('Z'))
-                    if added_date > cutoff_date and self._valid_token(t):
+                    if added_date > cutoff_date and self._valid_token(t, strict_checks):
                         recent_tokens.append(t)
                 except:
                     continue
@@ -44,21 +43,27 @@ class TokenAnalyzer:
             st.error(f"Token fetch error: {str(e)}")
             return []
 
-    def _valid_token(self, token):
-        """Validate token meets basic criteria"""
+    def _valid_token(self, token, strict_checks):
+        """Configurable token validation"""
         try:
-            # Basic sanity checks
-            return (
-                token['symbol'] != 'SOL' and
-                Pubkey.from_string(token['address']) and
-                float(token['price']) > 0 and
-                token.get('extensions', {}).get('coingeckoId')
-            )
+            # Basic checks that apply to all tokens
+            if not Pubkey.from_string(token['address']):
+                return False
+            
+            # Strict mode checks
+            if strict_checks:
+                return (
+                    token['symbol'] != 'SOL' and
+                    float(token.get('price', 0)) > 0 and
+                    token.get('extensions', {}).get('coingeckoId') and
+                    token.get('extensions', {}).get('website')
+                )
+            return True  # Only check valid address in non-strict mode
         except:
             return False
 
     def deep_analyze(self, token):
-        """Perform institutional-grade analysis with rate limiting"""
+        """Comprehensive token analysis"""
         time.sleep(REQUEST_INTERVAL)
         mint = token['address']
         
@@ -107,7 +112,8 @@ class TokenAnalyzer:
                 'confidence': confidence,
                 'rating': rating,
                 'added_date': token['timeAdded'],
-                'explorer': f"https://solscan.io/token/{mint}"
+                'explorer': f"https://solscan.io/token/{mint}",
+                'validated': self._valid_token(token, strict_checks=True)
             }
         except Exception as e:
             st.error(f"Analysis failed for {token['symbol']}: {str(e)}")
@@ -175,8 +181,8 @@ class TokenAnalyzer:
         )
 
 def main():
-    st.set_page_config(page_title="Smart Token Analyzer", layout="wide")
-    st.title("🔭 Smart Token Discovery & Analysis")
+    st.set_page_config(page_title="Smart Token Analyzer Pro", layout="wide")
+    st.title("🔭 Advanced Token Discovery & Analysis")
     
     analyzer = TokenAnalyzer()
     
@@ -184,9 +190,15 @@ def main():
         st.session_state.analysis_results = pd.DataFrame()
 
     with st.sidebar:
-        st.header("Analysis Controls")
+        st.header("Analysis Parameters")
+        
+        # Configurable parameters
+        analysis_days = st.number_input("Analysis Days", 1, 30, 3)
         min_rating = st.slider("Minimum Rating", 0, 100, 75)
         min_mcap = st.number_input("Minimum Market Cap (USD)", 0, 1000000000, 100000)
+        strict_checks = st.checkbox("Strict Validation", value=True,
+                                  help="Enable strict token validation checks")
+        
         run_analysis = st.button("🚀 Find Promising Tokens")
         
         if st.session_state.analysis_results.empty:
@@ -200,10 +212,10 @@ def main():
             )
 
     if run_analysis:
-        with st.spinner(f"Finding tokens added in last {ANALYSIS_DAYS} days..."):
-            recent_tokens = analyzer.get_recent_tokens()
+        with st.spinner(f"Finding tokens added in last {analysis_days} days..."):
+            recent_tokens = analyzer.get_recent_tokens(days=analysis_days, strict_checks=strict_checks)
             if not recent_tokens:
-                st.error("No new tokens found meeting basic criteria")
+                st.error("No new tokens found meeting criteria")
                 return
                 
             st.info(f"Found {len(recent_tokens)} new tokens, starting deep analysis...")
@@ -240,6 +252,7 @@ def main():
                 'volatility_index': 'Volatility %',
                 'depth_quality': 'Depth Quality',
                 'confidence': 'Confidence',
+                'validated': 'Validated',
                 'explorer': st.column_config.LinkColumn('Explorer')
             },
             hide_index=True,
