@@ -17,21 +17,22 @@ RESULTS_FILE = "solana_contract_scan.csv"
 solana_client = Client(SOLANA_RPC_ENDPOINT)
 
 # ======================
-# Blockchain Data Functions
+# Core Blockchain Functions
 # ======================
+
 def fetch_token_list():
-    """Fetch tokens from Jupiter Aggregator with validation"""
+    """Fetch and validate token list from Jupiter Aggregator"""
     try:
-        response = requests.get(JUPITER_TOKEN_LIST, timeout=10)
+        response = requests.get(JUPITER_TOKEN_LIST, timeout=15)
         response.raise_for_status()
         tokens = response.json()
         return [t for t in tokens if _is_valid_spl_token(t.get('address'))]
     except Exception as e:
-        st.error(f"Token list error: {str(e)}")
+        st.error(f"🚨 Token list error: {str(e)}")
         return []
 
 def _is_valid_spl_token(mint_address: str) -> bool:
-    """Validate SPL token address"""
+    """Validate SPL token address structure"""
     try:
         if mint_address == "So11111111111111111111111111111111111111112":
             return False
@@ -41,297 +42,362 @@ def _is_valid_spl_token(mint_address: str) -> bool:
         return False
 
 def get_token_price(mint_address: str) -> float:
-    """Get price using Jupiter v2 API"""
+    """Get price from Jupiter v2 API with enhanced error handling"""
     try:
         response = requests.get(
             f"{JUPITER_PRICE_API}?ids={mint_address}",
-            timeout=5
+            timeout=10
         )
         if response.status_code == 200:
             price_data = response.json()
-            return float(price_data['data'][mint_address]['price'])
+            if (price_data.get('data') and 
+                mint_address in price_data['data'] and 
+                'price' in price_data['data'][mint_address]):
+                return float(price_data['data'][mint_address]['price'])
         return 0.0
     except Exception as e:
-        st.error(f"Price error for {mint_address}: {str(e)}")
+        st.error(f"💸 Price error for {mint_address}: {str(e)}")
         return 0.0
 
-def get_token_details(mint_address: str):
-    """Get on-chain token details"""
+def get_token_metadata(mint_address: str):
+    """Get social/ecosystem metadata for token"""
     try:
-        pubkey = Pubkey.from_string(mint_address)
-        
-        # Get token supply
-        supply_info = solana_client.get_token_supply(pubkey)
+        response = requests.get(JUPITER_TOKEN_LIST, timeout=10)
+        tokens = response.json()
+        for t in tokens:
+            if t['address'] == mint_address:
+                return {
+                    'twitter': t.get('extensions', {}).get('twitter'),
+                    'website': t.get('extensions', {}).get('website'),
+                    'tags': t.get('tags', []),
+                    'verified': t.get('extensions', {}).get('verified', False)
+                }
+        return {}
+    except:
+        return {}
+
+def get_holder_metrics(mint_address: str):
+    """Get holder distribution metrics"""
+    try:
+        response = solana_client.get_token_largest_accounts(Pubkey.from_string(mint_address))
+        accounts = response.value
+        if not accounts:
+            return {}
+            
+        total = sum(int(acc.amount) for acc in accounts)
+        top10 = sum(int(acc.amount) for acc in accounts[:10])
+        return {
+            'holder_count': len(accounts),
+            'top10_holders': (top10 / total) * 100 if total > 0 else 0
+        }
+    except:
+        return {}
+
+# ======================
+# Data Processing Engine
+# ======================
+
+def process_token_entry(token):
+    """Full token data processing pipeline"""
+    mint_address = token.get('address')
+    if not mint_address or not _is_valid_spl_token(mint_address):
+        return None
+
+    try:
+        # Get blockchain data
+        supply_info = solana_client.get_token_supply(Pubkey.from_string(mint_address))
         if not supply_info.value:
             return None
             
         decimals = supply_info.value.decimals
         raw_supply = int(supply_info.value.amount)
         supply = raw_supply / (10 ** decimals)
-
-        # Get price
         price = get_token_price(mint_address)
+        if price <= 0:
+            return None
 
-        # Get approximate age from mint address
-        decoded = bytes(pubkey)
+        # Calculate age from mint address
+        decoded = bytes(Pubkey.from_string(mint_address))
         timestamp = int.from_bytes(decoded[:4], byteorder='big') / 1000
         age_days = (datetime.now() - datetime.fromtimestamp(timestamp)).days
 
+        # Get additional metrics
+        metadata = get_token_metadata(mint_address)
+        holders = get_holder_metrics(mint_address)
+        
+        # Calculate market cap
+        market_cap = price * supply
+
         return {
-            'supply': supply,
-            'decimals': decimals,
+            'symbol': token['symbol'].upper(),
+            'name': token['name'],
+            'contract_address': mint_address,
             'price': price,
-            'market_cap': price * supply,
+            'market_cap': market_cap,
+            'supply': supply,
             'age_days': age_days,
+            'decimals': decimals,
+            'twitter': bool(metadata.get('twitter')),
+            'website': bool(metadata.get('website')),
+            'tags': ', '.join(metadata.get('tags', [])),
+            'verified': metadata.get('verified', False),
+            'holder_count': holders.get('holder_count', 0),
+            'top10_holders': holders.get('top10_holders', 0),
+            'liquidity_score': calculate_liquidity_score(
+                price=price,
+                market_cap=market_cap,
+                age_days=age_days,
+                verified=metadata.get('verified'),
+                holder_count=holders.get('holder_count'),
+                top10_holders=holders.get('top10_holders'),
+                social_score=sum([bool(metadata.get('twitter')), bool(metadata.get('website'))])
+            ),
+            'explorer': f"https://solscan.io/token/{mint_address}",
             'timestamp': datetime.now().isoformat()
         }
     except Exception as e:
-        st.error(f"Detail error for {mint_address}: {str(e)}")
+        st.error(f"🔧 Processing error for {mint_address}: {str(e)}")
         return None
 
-# ======================
-# Data Processing
-# ======================
-def process_token_entry(token):
-    """Process token data with validation"""
-    if not _is_valid_spl_token(token.get('address')):
-        return None
-
-    details = get_token_details(token['address'])
-    if not details or details['price'] <= 0:
-        return None
-
-    return {
-        'symbol': token['symbol'].upper(),
-        'name': token['name'],
-        'contract_address': token['address'],
-        'price': details['price'],
-        'market_cap': details['market_cap'],
-        'supply': details['supply'],
-        'age_days': details['age_days'],
-        'decimals': details['decimals'],
-        'verified': token.get('extensions', {}).get('verified', False),
-        'liquidity_score': calculate_liquidity_score(token, details),
-        'explorer': f"https://solscan.io/token/{token['address']}",
-        **details
-    }
-
-def calculate_liquidity_score(token, details):
-    """Calculate composite liquidity score"""
+def calculate_liquidity_score(**metrics):
+    """Professional liquidity scoring algorithm"""
     score = 0
-    score += min(50, details['market_cap'] / 1e6 * 0.5) if details['market_cap'] else 0
-    score += 30 if token.get('extensions', {}).get('verified') else 0
-    score += min(20, details['age_days'] * 0.2)
-    return round(score, 1)
+    
+    # Market Cap Score (0-30 points)
+    score += min(30, metrics['market_cap'] / 1e6 * 0.3) if metrics['market_cap'] else 0
+    
+    # Verification Score (0-15 points)
+    score += 15 if metrics['verified'] else 0
+    
+    # Age Score (0-20 points)
+    score += min(20, metrics['age_days'] * 0.2)
+    
+    # Social Score (0-10 points)
+    score += metrics['social_score'] * 5  # 5 points per social presence
+    
+    # Holder Distribution Score (0-25 points)
+    holder_score = min(15, metrics['holder_count'] / 1000)  # 1 point per 1000 holders
+    concentration_score = 10 - (metrics['top10_holders'] * 0.1)  # Lower concentration = better
+    score += holder_score + max(0, concentration_score)
+
+    return round(min(100, score), 1)
 
 # ======================
-# Analysis Engine
+# Analysis & UI Components
 # ======================
+
 class BlockchainAnalyzer:
     def __init__(self, params):
         self.params = params
 
     def analyze_token(self, token):
-        """Apply analysis filters"""
-        if not token or not isinstance(token, dict):
+        """Apply professional-grade filters"""
+        if not token:
             return None
 
-        try:
-            checks = [
-                token.get('market_cap', 0) >= self.params['min_mcap'],
-                token.get('price', 0) >= self.params['min_price'],
-                token.get('liquidity_score', 0) >= self.params['min_liquidity'],
-                token.get('verified', False) or not self.params['verified_only'],
-                token.get('age_days', 0) >= self.params['min_age']
-            ]
-            return token if all(checks) else None
-        except Exception as e:
-            st.error(f"Analysis error: {str(e)}")
-            return None
+        checks = [
+            token['market_cap'] >= self.params['min_mcap'],
+            token['price'] >= self.params['min_price'],
+            token['liquidity_score'] >= self.params['min_liquidity'],
+            token['age_days'] >= self.params['min_age'],
+            token['holder_count'] >= self.params['min_holders'],
+            (not self.params['verified_only'] or token['verified']),
+            token['top10_holders'] <= self.params['max_concentration']
+        ]
+        return token if all(checks) else None
 
-# ======================
-# UI & Data Management
-# ======================
 def initialize_session():
     """Initialize Streamlit session state"""
-    default_columns = [
-        'timestamp', 'symbol', 'contract_address', 'price',
-        'market_cap', 'liquidity_score', 'verified', 'age_days'
-    ]
-    
     if 'params' not in st.session_state:
         st.session_state.params = {
             'min_mcap': 1e4,
             'min_price': 0.001,
             'min_liquidity': 50,
-            'verified_only': False,
-            'min_age': 7
+            'min_age': 7,
+            'min_holders': 100,
+            'max_concentration': 90,
+            'verified_only': False
         }
     
     if 'results' not in st.session_state:
         try:
             st.session_state.results = pd.read_csv(RESULTS_FILE)
-            for col in default_columns:
-                if col not in st.session_state.results.columns:
-                    st.session_state.results[col] = None
         except:
-            st.session_state.results = pd.DataFrame(columns=default_columns)
+            st.session_state.results = pd.DataFrame(columns=[
+                'timestamp', 'symbol', 'contract_address', 'price', 
+                'market_cap', 'liquidity_score', 'verified', 'age_days',
+                'holder_count', 'top10_holders', 'tags', 'explorer'
+            ])
 
 def save_results():
-    """Persist results to CSV"""
-    try:
-        st.session_state.results.to_csv(RESULTS_FILE, index=False)
-    except Exception as e:
-        st.error(f"Save error: {str(e)}")
+    """Save results with data validation"""
+    st.session_state.results.to_csv(RESULTS_FILE, index=False)
+
+def display_metrics():
+    """Show real-time analysis metrics"""
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Contracts", len(st.session_state.results))
+    with col2:
+        avg_score = st.session_state.results['liquidity_score'].mean()
+        st.metric("Avg Liquidity Score", f"{avg_score:.1f}/100")
+    with col3:
+        new_today = len(st.session_state.results[
+            pd.to_datetime(st.session_state.results['timestamp']).dt.date == datetime.today().date()
+        ])
+        st.metric("New Today", new_today)
+    with col4:
+        verified_count = st.session_state.results['verified'].sum()
+        st.metric("Verified Contracts", verified_count)
 
 def display_results():
-    """Render results table"""
+    """Professional results display"""
     if st.session_state.results.empty:
-        st.info("No results found. Run a scan first.")
+        st.info("📭 No results found. Run a scan first.")
         return
 
-    try:
-        df = st.session_state.results.copy()
-        df['price'] = df['price'].apply(
-            lambda x: f"${x:.4f}" if x >= 0.0001 else f"${x:.8f}")
-        df['market_cap'] = df['market_cap'].apply(
-            lambda x: f"${x/1e3:,.1f}K" if x < 1e6 else f"${x/1e6:.2f}M")
-        
-        st.dataframe(
-            df.sort_values('market_cap', ascending=False),
-            column_config={
-                'symbol': 'Symbol',
-                'price': 'Price',
-                'market_cap': 'Market Cap',
-                'liquidity_score': st.column_config.ProgressColumn(
-                    'Liquidity',
-                    format="%.1f",
-                    min_value=0,
-                    max_value=100
-                ),
-                'contract_address': 'Contract Address',
-                'verified': 'Verified',
-                'age_days': 'Age (Days)',
-                'explorer': st.column_config.LinkColumn('Block Explorer')
-            },
-            height=700,
-            use_container_width=True,
-            hide_index=True
-        )
-    except Exception as e:
-        st.error(f"Display error: {str(e)}")
+    df = st.session_state.results.copy()
+    
+    # Formatting
+    df['price'] = df['price'].apply(lambda x: f"${x:.4f}" if x >= 0.0001 else f"${x:.8f}")
+    df['market_cap'] = df['market_cap'].apply(lambda x: f"${x/1e6:.2f}M" if x >= 1e6 else f"${x/1e3:,.0f}K")
+    df['top10_holders'] = df['top10_holders'].apply(lambda x: f"{x:.1f}%")
+    
+    st.dataframe(
+        df.sort_values('liquidity_score', ascending=False),
+        column_config={
+            'symbol': 'Symbol',
+            'contract_address': 'Contract Address',
+            'price': 'Price',
+            'market_cap': 'Market Cap',
+            'liquidity_score': st.column_config.ProgressColumn(
+                'Liquidity Score',
+                format="%.1f",
+                min_value=0,
+                max_value=100
+            ),
+            'age_days': 'Age (Days)',
+            'holder_count': 'Holders',
+            'top10_holders': 'Top 10%',
+            'verified': 'Verified',
+            'tags': 'Categories',
+            'explorer': st.column_config.LinkColumn('Explorer')
+        },
+        column_order=[
+            'symbol', 'price', 'market_cap', 'liquidity_score',
+            'age_days', 'holder_count', 'top10_holders', 'verified',
+            'tags', 'contract_address', 'explorer'
+        ],
+        height=700,
+        use_container_width=True,
+        hide_index=True
+    )
 
 # ======================
 # Streamlit UI
 # ======================
+
 def main():
     st.set_page_config(
-        page_title="Solana Contract Scanner",
+        page_title="Professional Solana Scanner",
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    st.title("🔭 Solana SPL Token Scanner")
-
+    st.title("🔬 Professional Solana Contract Analyzer")
+    
+    # Session initialization
     initialize_session()
 
     # Sidebar Controls
     with st.sidebar:
-        st.header("Scan Parameters")
+        st.header("Analysis Parameters")
         
+        st.subheader("Core Metrics")
+        st.session_state.params['min_mcap'] = st.number_input(
+            "Minimum Market Cap (USD)",
+            min_value=0.0,
+            value=1e4,
+            step=1e3,
+            format="%.0f"
+        )
+        st.session_state.params['min_price'] = st.number_input(
+            "Minimum Price (USD)",
+            min_value=0.0,
+            value=0.001,
+            step=0.001,
+            format="%.4f"
+        )
+        st.session_state.params['min_liquidity'] = st.slider(
+            "Liquidity Score Threshold",
+            0, 100, 50
+        )
+        
+        st.subheader("Advanced Filters")
         col1, col2 = st.columns(2)
         with col1:
-            st.session_state.params['min_mcap'] = st.number_input(
-                "Min Market Cap (USD)",
-                min_value=0.0,
-                value=1e4,
-                step=1e3,
-                format="%.0f"
-            )
-            st.session_state.params['min_price'] = st.number_input(
-                "Min Price (USD)",
-                min_value=0.0,
-                value=0.001,
-                step=0.001,
-                format="%.4f"
-            )
-            
-        with col2:
-            st.session_state.params['min_liquidity'] = st.slider(
-                "Liquidity Score",
-                min_value=0,
-                max_value=100,
-                value=50
-            )
             st.session_state.params['min_age'] = st.slider(
-                "Min Age (Days)",
-                min_value=0,
-                max_value=365,
-                value=7
+                "Minimum Age (Days)",
+                0, 365, 7
+            )
+            st.session_state.params['min_holders'] = st.number_input(
+                "Minimum Holders",
+                1, 100000, 100
+            )
+        with col2:
+            st.session_state.params['max_concentration'] = st.slider(
+                "Max Top 10% Concentration",
+                1, 100, 90
+            )
+            st.session_state.params['verified_only'] = st.checkbox(
+                "Verified Contracts Only"
             )
         
-        st.session_state.params['verified_only'] = st.checkbox(
-            "Verified Only",
-            value=False
-        )
-
-        if st.button("🔍 Start Scan", type="primary"):
-            with st.spinner("Scanning blockchain..."):
+        if st.button("🚀 Start Deep Analysis", type="primary"):
+            with st.spinner("🔍 Scanning blockchain..."):
                 start_time = time.time()
                 try:
                     tokens = fetch_token_list()
                     analyzer = BlockchainAnalyzer(st.session_state.params)
                     
-                    new_results = []
-                    for token in tokens[:100]:  # Process first 100 tokens
-                        processed = process_token_entry(token)
-                        if result := analyzer.analyze_token(processed):
-                            new_results.append(result)
-                        time.sleep(0.25)  # Rate limiting
+                    results = []
+                    for token in tokens[:150]:  # Process top 150 tokens
+                        if processed := process_token_entry(token):
+                            if analyzed := analyzer.analyze_token(processed):
+                                results.append(analyzed)
+                        time.sleep(0.1)  # Rate limiting
 
-                    if new_results:
-                        new_df = pd.DataFrame(new_results)
+                    if results:
+                        new_df = pd.DataFrame(results)
                         st.session_state.results = pd.concat(
-                            [st.session_state.results, new_df],
-                            ignore_index=True
-                        ).drop_duplicates(['contract_address'], keep='last')
+                            [st.session_state.results, new_df]
+                        ).drop_duplicates('contract_address', keep='last')
                         save_results()
-                        st.success(f"Found {len(new_results)} contracts!")
+                        st.success(f"✅ Found {len(results)} qualifying contracts!")
                     else:
-                        st.warning("No matches found")
+                        st.warning("⚠️ No contracts matched criteria")
                     
-                    st.write(f"Scan took {time.time() - start_time:.2f}s")
+                    st.write(f"⏱️ Scan completed in {time.time() - start_time:.2f}s")
                 except Exception as e:
-                    st.error(f"Scan failed: {str(e)}")
+                    st.error(f"🔥 Critical error: {str(e)}")
 
         st.download_button(
-            "📥 Download Results",
+            "💾 Export Full Report",
             data=st.session_state.results.to_csv(index=False),
-            file_name="solana_contracts.csv",
+            file_name="solana_contract_analysis.csv",
             mime="text/csv"
         )
 
-        if st.button("🔄 Reset Data"):
+        if st.button("🔄 Reset Database"):
             st.session_state.results = pd.DataFrame(columns=[
                 'timestamp', 'symbol', 'contract_address', 'price',
-                'market_cap', 'liquidity_score', 'verified', 'age_days'
+                'market_cap', 'liquidity_score', 'verified', 'age_days',
+                'holder_count', 'top10_holders', 'tags', 'explorer'
             ])
             save_results()
-            st.success("Data cleared")
+            st.success("♻️ Database cleared successfully")
 
     # Main Display
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Contracts", len(st.session_state.results))
-    with col2:
-        avg_score = st.session_state.results['liquidity_score'].mean() \
-            if not st.session_state.results.empty else 0
-        st.metric("Avg Liquidity", f"{avg_score:.1f}/100")
-    with col3:
-        new_today = len(st.session_state.results[
-            pd.to_datetime(st.session_state.results['timestamp']).dt.date == datetime.today().date()
-        ]) if not st.session_state.results.empty else 0
-        st.metric("New Today", new_today)
-
+    display_metrics()
     display_results()
 
 if __name__ == "__main__":
