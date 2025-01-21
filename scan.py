@@ -320,10 +320,10 @@ class UIManager:
             volume = current_analysis.get('volume', 0.0) if current_analysis else 0.0
 
             st.markdown(f"""
-            **Price:** ${price:.4f}  
-            **Market Cap:** ${market_cap:,.0f}  
-            **Rating:** {rating:.1f}/100  
-            **Volume (24h):** ${volume:,.0f}
+            Price:** ${price:.8f}  
+            Market Cap: ${market_cap}  
+            Rating: {rating:.1f}/100  
+            Volume (24h):** ${volume:,.0f}
             """)
 
     def start_analysis(self, params):
