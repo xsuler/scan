@@ -74,6 +74,7 @@ class TokenAnalyzer:
                 reasons.append('Invalid SPL address')
                 return False, reasons
 
+            st.info(token.get("tags"))
             checks = [
                     ('tag', lambda: "verified" in token.get('tags'), 'Missing symbol'),
                 ]
