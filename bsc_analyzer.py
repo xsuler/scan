@@ -234,4 +234,4 @@ class BSCQuantAnalyzer:
     def _router_abi(self):
         return [
             {"constant":True,"inputs":[],"name":"factory","outputs":[{"name":"","type":"address"}],"type":"function"}
-      ]
+        ]
