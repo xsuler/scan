@@ -1,298 +1,55 @@
 import streamlit as st
 import pandas as pd
-import traceback
 import requests
 import time
 import numpy as np
 from solders.pubkey import Pubkey
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from threading import Thread, Lock
-import queue
-import copy
 
 # Configuration
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
 JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-UI_REFRESH_INTERVAL = 0.01
+DEFAULT_BATCH_SIZE = 5
 ROW_HEIGHT = 35
 HEADER_HEIGHT = 50
 
-class BackgroundAnalyzer:
+# Initialize session state
+if 'analysis' not in st.session_state:
+    st.session_state.update({
+        'analysis': {
+            'running': False,
+            'tokens': [],
+            'results': pd.DataFrame(),
+            'current_index': 0,
+            'start_time': None,
+            'total_tokens': 0
+        },
+        'config': {
+            'batch_size': DEFAULT_BATCH_SIZE,
+            'strict_mode': True,
+            'score_weights': {'liquidity': 0.4, 'stability': 0.4, 'depth': 0.2},
+            'price_impact_levels': ['10', '100'],
+            'show_advanced': False,
+            'columns': ['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer']
+        }
+    })
+
+class EnhancedAnalyzer:
     def __init__(self):
-        self.task_queue = queue.Queue()
-        self.result_queue = queue.Queue()
-        self.lock = Lock()
-        self.worker = None
         self.session = requests.Session()
         retries = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])
         self.session.mount('https://', HTTPAdapter(max_retries=retries))
-        
-    def start_analysis(self, tokens, params):
-        with self.lock:
-            if self.worker and self.worker.is_alive():
-                return False
-            
-            # Clear queues
-            while not self.task_queue.empty():
-                self.task_queue.get()
-            while not self.result_queue.empty():
-                self.result_queue.get()
-            
-            # Add all tokens to task queue
-            for token in tokens:
-                self.task_queue.put((token, params))
-            
-            # Start worker thread
-            self.worker = Thread(target=self._process_tokens)
-            self.worker.daemon = True
-            self.worker.start()
-            return True
-
-    def _process_tokens(self):
-        while not self.task_queue.empty():
-            try:
-                token, params = self.task_queue.get()
-                result = self._analyze_token(token, params)
-                if result:
-                    self.result_queue.put(result)
-            except Exception as e:
-                self.result_queue.put({'error': str(e)})
-            finally:
-                self.task_queue.task_done()
-                time.sleep(0.01)  # Prevent resource hogging
-
-    def _analyze_token(self, token, params):
-        try:
-            price_data = self._get_token_price_data(token)
-            analysis = {
-                'symbol': token.get('symbol', 'Unknown'),
-                'address': token['address'],
-                'price': self._safe_float(price_data.get('price', 0)),
-                'price_type': price_data.get('type', 'N/A'),
-                'liquidity': self._calculate_liquidity_score(token),
-                'confidence': price_data.get('confidence', 'medium'),
-                'buy_price': self._safe_float(price_data.get('buy_price', 0)),
-                'sell_price': self._safe_float(price_data.get('sell_price', 0)),
-                'price_impact_10': self._safe_float(price_data.get('price_impact_10', 0)),
-                'price_impact_100': self._safe_float(price_data.get('price_impact_100', 0)),
-                'explorer': f"https://solscan.io/token/{token['address']}",
-            }
-            analysis['score'] = self._calculate_score(analysis)
-            return analysis
-        except Exception as e:
-            return {'error': f"{token.get('symbol')}: {str(e)}"}
-
-    def get_progress(self):
-        with self.lock:
-            if self.task_queue.empty():
-                return 1.0
-            size = self.task_queue.qsize()
-            total = size + self.task_queue.unfinished_tasks
-            return 1 - (size / total) if total > 0 else 0
-
-    def get_results(self):
-        results = []
-        while not self.result_queue.empty():
-            results.append(self.result_queue.get())
-        return results
-
-    def _safe_float(self, value, default=0.0):
+    
+    def safe_float(self, value, default=0.0):
         try:
             return float(value) if value not in [None, np.nan, ''] else default
         except:
             return default
 
-    def _calculate_liquidity_score(self, token):
-        try:
-            decimals = token.get('decimals', 9)
-            amount = int(1000 * (10 ** decimals))
-            response = self.session.get(
-                f"{JUPITER_QUOTE_API}?inputMint={token['address']}&outputMint={USDC_MINT}&amount={amount}",
-                timeout=15
-            )
-            response.raise_for_status()
-            quote = response.json()
-            price_impact = self._safe_float(quote.get('priceImpactPct', 1))
-            return max(0.0, 100.0 - (price_impact * 10000))
-        except Exception as e:
-            return 0.0
-
-    def _calculate_score(self, analysis):
-        try:
-            liquidity = analysis['liquidity'] / 100
-            price = analysis['price']
-            buy_price = analysis['buy_price']
-            sell_price = analysis['sell_price']
-            
-            if price <= 0 or (buy_price == 0 and sell_price == 0):
-                price_stability = 0.0
-            else:
-                spread = abs(buy_price - sell_price)
-                price_stability = 1 - (spread / price) if price != 0 else 0
-                price_stability = np.clip(price_stability, 0, 1)
-            
-            impact_10 = analysis['price_impact_10']
-            impact_100 = analysis['price_impact_100']
-            avg_impact = (impact_10 + impact_100) / 2
-            market_depth = 1 - np.clip(avg_impact, 0, 1)
-            
-            weights = {'liquidity': 0.4, 'price_stability': 0.35, 'market_depth': 0.25}
-            penalties = 0
-            if price <= 0: penalties += 0.3
-            if analysis['liquidity'] <= 0: penalties += 0.2
-            if analysis['confidence'] != 'high': penalties += 0.1
-                
-            raw_score = (weights['liquidity'] * liquidity +
-                        weights['price_stability'] * price_stability +
-                        weights['market_depth'] * market_depth)
-            
-            return (raw_score - penalties) * 100
-        except KeyError as e:
-            return 0.0
-
-    def _get_token_price_data(self, token):
-        try:
-            response = self.session.get(
-                f"{JUPITER_PRICE_API}?ids={token['address']}&showExtraInfo=true",
-                timeout=15
-            )
-            response.raise_for_status()
-            data = response.json()
-            price_data = data.get('data', {}).get(token['address'], {})
-            return {
-                'price': self._safe_float(price_data.get('price', 0)),
-                'type': price_data.get('type', 'N/A'),
-                'confidence': price_data.get('extraInfo', {}).get('confidenceLevel', 'medium'),
-                'buy_price': self._safe_float(price_data.get('extraInfo', {}).get('quotedPrice', {}).get('buyPrice', 0)),
-                'sell_price': self._safe_float(price_data.get('extraInfo', {}).get('quotedPrice', {}).get('sellPrice', 0)),
-                'price_impact_10': self._safe_float(price_data.get('extraInfo', {}).get('depth', {}).get('sellPriceImpactRatio', {}).get('depth', {}).get('10', 0)),
-                'price_impact_100': self._safe_float(price_data.get('extraInfo', {}).get('depth', {}).get('sellPriceImpactRatio', {}).get('depth', {}).get('100', 0)),
-            }
-        except Exception as e:
-            return {}
-
-class AnalysisManager:
-    def __init__(self):
-        self.bg_analyzer = BackgroundAnalyzer()
-        self.init_session()
-        
-    def init_session(self):
-        if 'analysis' not in st.session_state:
-            st.session_state.analysis = {
-                'running': False,
-                'params': None,
-                'tokens': [],
-                'results': pd.DataFrame(),
-                'start_time': None,
-                'total_tokens': 0
-            }
-
-    def start_analysis(self, tokens, params):
-        st.session_state.analysis.update({
-            'running': True,
-            'params': params,
-            'tokens': copy.deepcopy(tokens),
-            'results': pd.DataFrame(),
-            'start_time': time.time(),
-            'total_tokens': len(tokens)
-        })
-        self.bg_analyzer.start_analysis(tokens, params)
-
-    def update_results(self):
-        if st.session_state.analysis['running']:
-            new_results = self.bg_analyzer.get_results()
-            if new_results:
-                valid_results = [r for r in new_results if 'error' not in r]
-                if valid_results:
-                    new_df = pd.DataFrame(valid_results)
-                    st.session_state.analysis['results'] = pd.concat(
-                        [st.session_state.analysis['results'], new_df],
-                        ignore_index=True
-                    )
-                
-                errors = [r['error'] for r in new_results if 'error' in r]
-                for error in errors:
-                    st.error(f"Analysis error: {error}")
-
-            # Check completion
-            progress = self.bg_analyzer.get_progress()
-            if progress >= 1.0:
-                st.session_state.analysis['running'] = False
-                if st.session_state.analysis['results'].empty:
-                    st.warning("No qualified tokens found during analysis")
-
-class UIManager:
-    def __init__(self):
-        self.manager = AnalysisManager()
-        self.inject_responsive_css()
-
-    def inject_responsive_css(self):
-        st.markdown("""
-        <style>
-            section[data-testid="stSidebar"] {
-                width: 100% !important;
-                min-width: 100% !important;
-                transform: translateX(0) !important;
-                z-index: 999999;
-            }
-            [data-testid="collapsedControl"] {
-                display: none !important;
-            }
-            @media (max-width: 768px) {
-                div.stButton > button { width: 100% !important; }
-                div[data-testid="column"] { width: 100% !important; }
-                div[data-testid="stDataFrame"] { font-size: 14px; }
-            }
-        </style>
-        """, unsafe_allow_html=True)
-
-    def render_sidebar(self):
-        with st.sidebar:
-            st.title("🪙 Solana Token Analyzer")
-            st.image("https://jup.ag/svg/jupiter-logo.svg", width=200)
-            
-            with st.expander("⚙️ Control Panel", expanded=True):
-                params = {
-                    'strict_mode': st.checkbox("Strict Validation", True),
-                    'live_sorting': st.checkbox("Real-time Sorting", True)
-                }
-
-            cols = st.columns([1, 1, 1])
-            with cols[0]:
-                if st.button("🚀 Start"):
-                    self.start_analysis(params)
-            with cols[1]:
-                if st.button("⏹ Stop"):
-                    st.session_state.analysis['running'] = False
-            with cols[2]:
-                if st.button("🧹 Clear"):
-                    st.session_state.analysis['results'] = pd.DataFrame()
-
-            if st.session_state.analysis['running']:
-                self.render_progress()
-
-            if not st.session_state.analysis['results'].empty:
-                st.divider()
-                self.render_sidebar_results()
-
-    def start_analysis(self, params):
-        try:
-            response = requests.get(JUPITER_TOKEN_LIST, timeout=15)
-            response.raise_for_status()
-            tokens = response.json()
-            valid_tokens = [t for t in tokens if self.validate_token(t, params['strict_mode'])]
-            
-            if valid_tokens:
-                self.manager.start_analysis(valid_tokens, params)
-            else:
-                st.error("No valid tokens found")
-        except Exception as e:
-            st.error(f"Failed to start analysis: {str(e)}")
-
-    def validate_token(self, token, strict_checks):
+    def validate_token(self, token):
         try:
             if not Pubkey.from_string(token.get('address', '')):
                 return False
@@ -302,62 +59,331 @@ class UIManager:
                 if not token.get(field):
                     return False
 
-            if strict_checks:
+            if st.session_state.config['strict_mode']:
                 if "community" in token.get('tags', []):
                     return False
                 if token.get('chainId') != 101:
                     return False
+
             return True
         except:
             return False
 
-    def render_progress(self):
-        analysis = st.session_state.analysis
-        progress = self.manager.bg_analyzer.get_progress()
+    def get_token_list(self):
+        try:
+            response = self.session.get(JUPITER_TOKEN_LIST, timeout=15)
+            response.raise_for_status()
+            return [t for t in response.json() if self.validate_token(t)]
+        except Exception as e:
+            st.error(f"Token fetch failed: {str(e)}")
+            return []
+
+    def analyze_token(self, token):
+        try:
+            price_data = self.get_price_data(token)
+            liquidity_data = self.get_liquidity_data(token)
+            
+            analysis = {
+                'symbol': token.get('symbol', 'Unknown'),
+                'address': token['address'],
+                'price': self.safe_float(price_data.get('price', 0)),
+                'buy_price': self.safe_float(price_data.get('buy_price', 0)),
+                'sell_price': self.safe_float(price_data.get('sell_price', 0)),
+                'price_impact': liquidity_data.get('price_impact', {}),
+                'liquidity': liquidity_data.get('score', 0),
+                'confidence': price_data.get('confidence', 'medium'),
+                'explorer': f"https://solscan.io/token/{token['address']}",
+                'score': 0
+            }
+            
+            analysis.update(self.calculate_metrics(analysis))
+            return analysis
+        except Exception as e:
+            st.error(f"Analysis failed: {str(e)}")
+            return None
+
+    def get_price_data(self, token):
+        try:
+            response = self.session.get(
+                f"{JUPITER_PRICE_API}?ids={token['address']}&showExtraInfo=true",
+                timeout=15
+            )
+            response.raise_for_status()
+            data = response.json()
+            price_data = data.get('data', {}).get(token['address'], {})
+            return {
+                'price': self.safe_float(price_data.get('price', 0)),
+                'buy_price': self.safe_float(price_data.get('extraInfo', {}).get('quotedPrice', {}).get('buyPrice', 0)),
+                'sell_price': self.safe_float(price_data.get('extraInfo', {}).get('quotedPrice', {}).get('sellPrice', 0)),
+                'confidence': price_data.get('extraInfo', {}).get('confidenceLevel', 'medium'),
+                'depth': price_data.get('extraInfo', {}).get('depth', {})
+            }
+        except:
+            return {}
+
+    def get_liquidity_data(self, token):
+        try:
+            decimals = token.get('decimals', 9)
+            amount = int(1000 * (10 ** decimals))
+            response = self.session.get(
+                f"{JUPITER_QUOTE_API}?inputMint={token['address']}&outputMint={USDC_MINT}&amount={amount}",
+                timeout=15
+            )
+            response.raise_for_status()
+            quote = response.json()
+            
+            price_impact = self.safe_float(quote.get('priceImpactPct', 1))
+            impacts = {
+                '10': self.safe_float(quote.get('priceImpactPct', 1)),
+                '100': self.safe_float(quote.get('priceImpactPct', 1)) * 10
+            }
+            
+            return {
+                'score': max(0.0, 100.0 - (price_impact * 10000)),
+                'price_impact': impacts
+            }
+        except:
+            return {'score': 0, 'price_impact': {}}
+
+    def calculate_metrics(self, analysis):
+        config = st.session_state.config
+        metrics = {}
         
-        st.progress(progress)
-        cols = st.columns(3)
-        with cols[0]:
-            st.metric("Processed", f"{int(progress * analysis['total_tokens'])}/{analysis['total_tokens']}")
-        with cols[1]:
-            elapsed = time.time() - analysis['start_time']
-            speed = analysis['total_tokens'] * progress / elapsed if elapsed > 0 else 0
-            st.metric("Speed", f"{speed:.1f} tkn/s")
-        with cols[2]:
-            st.metric("Found", len(analysis['results']))
-
-    def render_sidebar_results(self):
-        st.subheader("📊 Live Results")
-        df = st.session_state.analysis['results']
+        # Price stability
+        spread = abs(analysis['buy_price'] - analysis['sell_price'])
+        metrics['price_stability'] = 1 - (spread / analysis['price']) if analysis['price'] > 0 else 0
         
-        if df.empty:
-            return
-
-        sorted_df = df.sort_values(by='score', ascending=False)
-        sorted_df = sorted_df[['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer']]
-
-        st.data_editor(
-            sorted_df,
-            column_config={
-                'score': st.column_config.NumberColumn('Score', format="%.1f"),
-                'symbol': st.column_config.TextColumn('Token'),
-                'price': st.column_config.NumberColumn('Price', format="$%.4f"),
-                'liquidity': st.column_config.ProgressColumn('Liquidity', format="%.1f", min_value=0, max_value=100),
-                'confidence': st.column_config.SelectboxColumn('Confidence', options=['low', 'medium', 'high']),
-                'explorer': st.column_config.LinkColumn('Explorer'),
-            },
-            height=self.calculate_table_height(sorted_df),
-            use_container_width=True,
-            hide_index=True,
+        # Market depth
+        impacts = [analysis['price_impact'].get(lvl, 1) for lvl in config['price_impact_levels']]
+        metrics['market_depth'] = 1 - np.clip(np.mean(impacts), 0, 1)
+        
+        # Score calculation
+        weights = config['score_weights']
+        raw_score = (
+            weights['liquidity'] * (analysis['liquidity'] / 100) +
+            weights['stability'] * metrics['price_stability'] +
+            weights['depth'] * metrics['market_depth']
         )
+        
+        # Confidence penalty
+        penalty = 0.1 if analysis['confidence'] != 'high' else 0
+        metrics['score'] = max(0, (raw_score - penalty) * 100)
+        
+        return metrics
 
-    def calculate_table_height(self, df):
-        return min(HEADER_HEIGHT + len(df) * ROW_HEIGHT, 600)
+def main():
+    st.set_page_config(layout="wide", page_title="Advanced Token Analyzer")
+    analyzer = EnhancedAnalyzer()
+    
+    # Custom CSS
+    st.markdown("""
+    <style>
+        .settings-section { padding: 15px; border-radius: 10px; border: 1px solid #2d3b4e; }
+        .metric-box { padding: 10px; background: #1a1a1a; border-radius: 5px; }
+        @media (max-width: 768px) {
+            .stButton>button { width: 100% !important; }
+        }
+    </style>
+    """, unsafe_allow_html=True)
 
-    def render_main(self):
-        self.manager.update_results()
+    # Sidebar Controls
+    with st.sidebar:
+        st.title("🔧 Advanced Token Analyzer")
+        st.image("https://jup.ag/svg/jupiter-logo.svg", width=200)
+        
+        # Configuration Section
+        with st.expander("⚙️ Analysis Settings", expanded=True):
+            with st.container():
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.session_state.config['batch_size'] = st.number_input(
+                        "Batch Size", 1, 20, DEFAULT_BATCH_SIZE,
+                        help="Tokens processed per iteration"
+                    )
+                with col2:
+                    st.session_state.config['strict_mode'] = st.checkbox(
+                        "Strict Validation", True,
+                        help="Enable strict token filtering"
+                    )
+                
+                st.session_state.config['show_advanced'] = st.checkbox(
+                    "Show Advanced Settings", False
+                )
+                
+                if st.session_state.config['show_advanced']:
+                    with st.container():
+                        st.subheader("Score Weights")
+                        cols = st.columns(3)
+                        with cols[0]:
+                            st.session_state.config['score_weights']['liquidity'] = st.slider(
+                                "Liquidity", 0.0, 1.0, 0.4, 0.05
+                            )
+                        with cols[1]:
+                            st.session_state.config['score_weights']['stability'] = st.slider(
+                                "Stability", 0.0, 1.0, 0.4, 0.05
+                            )
+                        with cols[2]:
+                            st.session_state.config['score_weights']['depth'] = st.slider(
+                                "Market Depth", 0.0, 1.0, 0.2, 0.05
+                            )
+                        
+                        st.subheader("Price Impact Levels")
+                        st.session_state.config['price_impact_levels'] = st.multiselect(
+                            "Select Impact Levels",
+                            ['10', '100', '500', '1000'],
+                            default=['10', '100'],
+                            help="Price impact levels to consider in analysis"
+                        )
+                        
+                        st.subheader("Display Columns")
+                        st.session_state.config['columns'] = st.multiselect(
+                            "Select Columns to Display",
+                            ['score', 'symbol', 'price', 'buy_price', 'sell_price', 
+                             'liquidity', 'confidence', 'explorer', 'price_impact'],
+                            default=st.session_state.config['columns'],
+                            help="Select columns to show in results"
+                        )
+
+        # Action Buttons
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("🚀 Start", help="Begin analysis"):
+                start_analysis(analyzer)
+        with col2:
+            if st.button("⏹ Stop", help="Halt analysis"):
+                stop_analysis()
+        with col3:
+            if st.button("🧹 Clear", help="Reset results"):
+                clear_results()
+
+        # Progress Section
+        if st.session_state.analysis['running']:
+            show_progress()
+
+        # Results Display
+        if not st.session_state.analysis['results'].empty:
+            st.divider()
+            show_results()
+
+    # Main processing logic
+    if st.session_state.analysis['running']:
+        process_batch(analyzer)
+
+def start_analysis(analyzer):
+    tokens = analyzer.get_token_list()
+    if not tokens:
+        st.error("No valid tokens found")
+        return
+
+    st.session_state.analysis.update({
+        'running': True,
+        'tokens': tokens,
+        'results': pd.DataFrame(),
+        'current_index': 0,
+        'start_time': time.time(),
+        'total_tokens': len(tokens)
+    })
+    st.rerun()
+
+def process_batch(analyzer):
+    analysis = st.session_state.analysis
+    batch_size = st.session_state.config['batch_size']
+    start_idx = analysis['current_index']
+    end_idx = min(start_idx + batch_size, analysis['total_tokens'])
+
+    for idx in range(start_idx, end_idx):
+        token = analysis['tokens'][idx]
+        result = analyzer.analyze_token(token)
+        if result:
+            new_df = pd.DataFrame([result])
+            analysis['results'] = pd.concat([analysis['results'], new_df], ignore_index=True)
+        analysis['current_index'] += 1
+
+    if analysis['current_index'] >= analysis['total_tokens']:
+        analysis['running'] = False
+        if analysis['results'].empty:
+            st.warning("No qualified tokens found")
+    else:
+        time.sleep(0.1)
+        st.rerun()
+
+def show_progress():
+    analysis = st.session_state.analysis
+    progress = analysis['current_index'] / analysis['total_tokens']
+    
+    st.progress(progress, text="Analysis Progress")
+    
+    cols = st.columns(3)
+    with cols[0]:
+        st.metric("Processed", f"{analysis['current_index']}/{analysis['total_tokens']}")
+    with cols[1]:
+        elapsed = time.time() - analysis['start_time']
+        speed = analysis['current_index'] / elapsed if elapsed > 0 else 0
+        st.metric("Speed", f"{speed:.1f} tkn/s")
+    with cols[2]:
+        st.metric("Found", len(analysis['results']))
+
+def show_results():
+    df = st.session_state.analysis['results']
+    config = st.session_state.config
+    
+    # Filter columns based on config
+    columns = [c for c in config['columns'] if c in df.columns]
+    if not columns:
+        return
+        
+    sorted_df = df.sort_values('score', ascending=False)[columns]
+    
+    # Configure column display
+    column_config = {
+        'score': st.column_config.NumberColumn(
+            'Score', format="%.1f", help="Composite quality score"
+        ),
+        'symbol': st.column_config.TextColumn('Token'),
+        'price': st.column_config.NumberColumn(
+            'Price', format="$%.4f", help="Current market price"
+        ),
+        'buy_price': st.column_config.NumberColumn(
+            'Buy Price', format="$%.4f", help="Best buy price"
+        ),
+        'sell_price': st.column_config.NumberColumn(
+            'Sell Price', format="$%.4f", help="Best sell price"
+        ),
+        'liquidity': st.column_config.ProgressColumn(
+            'Liquidity', format="%.1f", min_value=0, max_value=100
+        ),
+        'confidence': st.column_config.SelectboxColumn(
+            'Confidence', options=['low', 'medium', 'high']
+        ),
+        'explorer': st.column_config.LinkColumn('Explorer'),
+        'price_impact': st.column_config.BarChartColumn(
+            'Price Impact', y_min=0, y_max=100,
+            help="Price impact at different trade sizes"
+        )
+    }
+
+    st.dataframe(
+        sorted_df,
+        column_config=column_config,
+        height=min(HEADER_HEIGHT + len(df) * ROW_HEIGHT, 600),
+        use_container_width=True,
+        hide_index=True
+    )
+
+def stop_analysis():
+    st.session_state.analysis['running'] = False
+    st.rerun()
+
+def clear_results():
+    st.session_state.analysis.update({
+        'running': False,
+        'tokens': [],
+        'results': pd.DataFrame(),
+        'current_index': 0,
+        'start_time': None,
+        'total_tokens': 0
+    })
+    st.rerun()
 
 if __name__ == "__main__":
-    ui = UIManager()
-    ui.render_sidebar()
-    ui.render_main()
+    main()
