@@ -4,185 +4,162 @@ import requests
 import time
 import numpy as np
 import os
-import json
+import pickle
 from pathlib import Path
 from solders.pubkey import Pubkey
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# 配置参数
+# 配置常量
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
 JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-CHECKPOINT_DIR = Path("./checkpoints")
+CHECKPOINT_FILE = "checkpoint.pkl"
 DEFAULT_BATCH_SIZE = 5
 ROW_HEIGHT = 35
 HEADER_HEIGHT = 50
 
-# 创建检查点目录
+# 初始化检查点目录
+CHECKPOINT_DIR = Path("./checkpoints")
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 
-class CheckpointManager:
+class AnalysisState:
     @staticmethod
-    def get_checkpoint_files():
-        return {
-            "tokens": CHECKPOINT_DIR / "tokens.pkl",
-            "results": CHECKPOINT_DIR / "results.parquet",
-            "progress": CHECKPOINT_DIR / "progress.json",
-            "config": CHECKPOINT_DIR / "config.json"
-        }
-
-    @staticmethod
-    def save_checkpoint(tokens, results, progress, config):
-        files = CheckpointManager.get_checkpoint_files()
+    def save_state(state):
         try:
-            # 保存代币列表
-            tokens.to_pickle(files["tokens"])
-            
-            # 追加结果到Parquet文件
-            if not results.empty:
-                if files["results"].exists():
-                    existing = pd.read_parquet(files["results"])
-                    results = pd.concat([existing, results])
-                results.to_parquet(files["results"])
-            
-            # 保存处理进度
-            with open(files["progress"], "w") as f:
-                json.dump(progress, f)
-            
-            # 保存配置
-            with open(files["config"], "w") as f:
-                json.dump(config, f)
-            
-            return True
+            with open(CHECKPOINT_DIR / CHECKPOINT_FILE, "wb") as f:
+                pickle.dump(state, f)
         except Exception as e:
-            st.error(f"保存检查点失败: {str(e)}")
-            return False
+            st.error(f"状态保存失败: {str(e)}")
 
     @staticmethod
-    def load_checkpoint():
-        files = CheckpointManager.get_checkpoint_files()
-        if not all(f.exists() for f in files.values()):
-            return None
+    def load_state():
+        file_path = CHECKPOINT_DIR / CHECKPOINT_FILE
+        if file_path.exists():
+            try:
+                with open(file_path, "rb") as f:
+                    return pickle.load(f)
+            except Exception as e:
+                st.error(f"状态加载失败: {str(e)}")
+        return None
 
+    @staticmethod
+    def clear_state():
         try:
-            tokens = pd.read_pickle(files["tokens"])
-            results = pd.read_parquet(files["results"])
-            with open(files["progress"], "r") as f:
-                progress = json.load(f)
-            with open(files["config"], "r") as f:
-                config = json.load(f)
-            return {
-                "tokens": tokens,
-                "results": results,
-                "progress": progress,
-                "config": config
-            }
+            (CHECKPOINT_DIR / CHECKPOINT_FILE).unlink(missing_ok=True)
         except Exception as e:
-            st.error(f"加载检查点失败: {str(e)}")
-            return None
+            st.error(f"状态清除失败: {str(e)}")
 
-    @staticmethod
-    def clear_checkpoints():
-        files = CheckpointManager.get_checkpoint_files()
-        for f in files.values():
-            if f.exists():
-                try:
-                    f.unlink()
-                except Exception as e:
-                    st.error(f"删除文件{f.name}失败: {str(e)}")
-
-class EnhancedAnalyzer:
+class TokenAnalyzer:
     def __init__(self):
         self.session = requests.Session()
-        retries = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])
-        self.session.mount('https://', HTTPAdapter(max_retries=retries))
-    
-    def safe_float(self, value, default=0.0):
-        try:
-            return float(value) if value not in [None, np.nan, ''] else default
-        except:
-            return default
+        self._configure_session()
+        self.debug_log = []
+
+    def _configure_session(self):
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("https://", adapter)
 
     def validate_token(self, token, strict_mode):
+        validation_result = {
+            "valid": False,
+            "reasons": [],
+            "symbol": token.get("symbol", "UNKNOWN"),
+            "address": token.get("address", "")
+        }
+
         try:
-            if not Pubkey.from_string(token.get('address', '')):
+            if not Pubkey.from_string(token.get("address", "")):
+                validation_result["reasons"].append("Invalid address")
                 return False
 
-            required_fields = ['symbol', 'name', 'decimals', 'logoURI']
+            required_fields = ["symbol", "name", "decimals", "logoURI"]
             for field in required_fields:
                 if not token.get(field):
+                    validation_result["reasons"].append(f"Missing {field}")
                     return False
 
             if strict_mode:
-                if "community" in token.get('tags', []):
+                if "community" in token.get("tags", []):
+                    validation_result["reasons"].append("Community tag")
                     return False
-                if token.get('chainId') != 101:
+                if token.get("chainId") != 101:
+                    validation_result["reasons"].append("Non-mainnet token")
                     return False
 
+            validation_result["valid"] = True
             return True
-        except:
+        except Exception as e:
+            validation_result["reasons"].append(f"Validation error: {str(e)}")
             return False
+        finally:
+            self.debug_log.append(validation_result)
 
-    def get_token_list(self, strict_mode):
+    def fetch_token_list(self, strict_mode):
         try:
             response = self.session.get(JUPITER_TOKEN_LIST, timeout=15)
             response.raise_for_status()
-            return [t for t in response.json() if self.validate_token(t, strict_mode)]
+            tokens = response.json()
+            return [t for t in tokens if self.validate_token(t, strict_mode)]
         except Exception as e:
-            st.error(f"Token获取失败: {str(e)}")
+            st.error(f"代币获取失败: {str(e)}")
+            return []
+
+    def analyze_token(self, token):
+        try:
+            price_data = self._get_price_data(token)
+            liquidity_score = self._calculate_liquidity(token)
+            
+            analysis = {
+                "symbol": token.get("symbol", "UNKNOWN"),
+                "address": token["address"],
+                "price": price_data["price"],
+                "buy_price": price_data["buy_price"],
+                "sell_price": price_data["sell_price"],
+                "price_impact_10k": price_data["impact_10k"],
+                "price_impact_100k": price_data["impact_100k"],
+                "liquidity_score": liquidity_score,
+                "confidence": price_data["confidence"],
+                "explorer": f"https://solscan.io/token/{token['address']}",
+                "score": 0
+            }
+            
+            analysis["score"] = self._calculate_score(analysis)
+            return analysis
+        except Exception as e:
+            st.error(f"分析代币失败: {str(e)}")
             return None
 
-    def analyze_batch(self, tokens):
-        results = []
-        for token in tokens:
-            try:
-                analysis = self._analyze_token(token)
-                if analysis:
-                    results.append(analysis)
-            except Exception as e:
-                st.error(f"分析代币失败: {str(e)}")
-        return pd.DataFrame(results)
-
-    def _analyze_token(self, token):
-        price_data = self.get_price_data(token)
-        liquidity_data = self.get_liquidity_data(token)
-        
-        analysis = {
-            'symbol': token.get('symbol', 'Unknown'),
-            'address': token['address'],
-            'price': self.safe_float(price_data.get('price', 0)),
-            'buy_price': self.safe_float(price_data.get('buy_price', 0)),
-            'sell_price': self.safe_float(price_data.get('sell_price', 0)),
-            'liquidity': liquidity_data.get('score', 0),
-            'confidence': price_data.get('confidence', 'medium'),
-            'explorer': f"https://solscan.io/token/{token['address']}",
-            'score': self.calculate_score(price_data, liquidity_data)
-        }
-        return analysis
-
-    def get_price_data(self, token):
+    def _get_price_data(self, token):
         try:
             response = self.session.get(
                 f"{JUPITER_PRICE_API}?ids={token['address']}&showExtraInfo=true",
                 timeout=15
             )
             response.raise_for_status()
-            data = response.json()
-            price_data = data.get('data', {}).get(token['address'], {})
+            data = response.json().get("data", {}).get(token["address"], {})
+            
             return {
-                'price': self.safe_float(price_data.get('price', 0)),
-                'buy_price': self.safe_float(price_data.get('extraInfo', {}).get('quotedPrice', {}).get('buyPrice', 0)),
-                'sell_price': self.safe_float(price_data.get('extraInfo', {}).get('quotedPrice', {}).get('sellPrice', 0)),
-                'confidence': price_data.get('extraInfo', {}).get('confidenceLevel', 'medium')
+                "price": self._safe_float(data.get("price", 0)),
+                "buy_price": self._safe_float(data.get("extraInfo", {}).get("quotedPrice", {}).get("buyPrice", 0)),
+                "sell_price": self._safe_float(data.get("extraInfo", {}).get("quotedPrice", {}).get("sellPrice", 0)),
+                "impact_10k": self._safe_float(data.get("extraInfo", {}).get("depth", {}).get("sellPriceImpactRatio", {}).get("depth", {}).get("10", 0)),
+                "impact_100k": self._safe_float(data.get("extraInfo", {}).get("depth", {}).get("sellPriceImpactRatio", {}).get("depth", {}).get("100", 0)),
+                "confidence": data.get("extraInfo", {}).get("confidenceLevel", "medium")
             }
-        except:
+        except Exception as e:
+            st.error(f"价格数据获取失败: {str(e)}")
             return {}
 
-    def get_liquidity_data(self, token):
+    def _calculate_liquidity(self, token):
         try:
-            decimals = token.get('decimals', 9)
+            decimals = token.get("decimals", 9)
             amount = int(1000 * (10 ** decimals))
             response = self.session.get(
                 f"{JUPITER_QUOTE_API}?inputMint={token['address']}&outputMint={USDC_MINT}&amount={amount}",
@@ -190,215 +167,284 @@ class EnhancedAnalyzer:
             )
             response.raise_for_status()
             quote = response.json()
-            price_impact = self.safe_float(quote.get('priceImpactPct', 1))
-            return {
-                'score': max(0.0, 100.0 - (price_impact * 10000))
-            }
-        except:
-            return {'score': 0}
+            price_impact = self._safe_float(quote.get("priceImpactPct", 1))
+            return max(0.0, 100.0 - (price_impact * 10000))
+        except Exception as e:
+            st.error(f"流动性计算失败: {str(e)}")
+            return 0.0
 
-    def calculate_score(self, price_data, liquidity_data):
+    def _calculate_score(self, analysis):
         try:
-            liquidity = liquidity_data['score'] / 100
-            spread = abs(price_data['buy_price'] - price_data['sell_price'])
-            stability = 1 - (spread / price_data['price']) if price_data['price'] > 0 else 0
-            confidence = 0.9 if price_data['confidence'] == 'high' else 0.7
-            return (liquidity * 0.4 + stability * 0.4 + confidence * 0.2) * 100
-        except:
+            weights = {
+                "liquidity": 0.4,
+                "price_stability": 0.35,
+                "market_depth": 0.25
+            }
+            
+            spread = abs(analysis["buy_price"] - analysis["sell_price"])
+            price_stability = 1 - (spread / analysis["price"]) if analysis["price"] > 0 else 0
+            
+            market_depth = 1 - (analysis["price_impact_10k"] + analysis["price_impact_100k"]) / 2
+            
+            base_score = (
+                weights["liquidity"] * (analysis["liquidity_score"] / 100) +
+                weights["price_stability"] * price_stability +
+                weights["market_depth"] * market_depth
+            )
+            
+            confidence_factor = 1.0 if analysis["confidence"] == "high" else 0.8
+            return max(0, min(100, base_score * 100 * confidence_factor))
+        except Exception as e:
+            st.error(f"评分计算失败: {str(e)}")
             return 0
 
-def main():
-    st.set_page_config(layout="wide", page_title="带检查点的代币分析仪")
-    analyzer = EnhancedAnalyzer()
-    
-    # 初始化session状态
-    if 'analysis' not in st.session_state:
-        checkpoint = CheckpointManager.load_checkpoint()
-        if checkpoint:
-            st.session_state.update({
-                'analysis': {
-                    'running': True,
-                    'tokens': checkpoint['tokens'],
-                    'results': checkpoint['results'],
-                    'current_index': checkpoint['progress']['current_index'],
-                    'start_time': checkpoint['progress']['start_time'],
-                    'total_tokens': checkpoint['progress']['total_tokens']
-                },
-                'config': checkpoint['config']
-            })
+    @staticmethod
+    def _safe_float(value, default=0.0):
+        try:
+            return float(value) if value not in [None, np.nan, ""] else default
+        except:
+            return default
+
+def initialize_session():
+    if "analysis" not in st.session_state:
+        saved_state = AnalysisState.load_state()
+        if saved_state:
+            st.session_state.update(saved_state)
         else:
             st.session_state.update({
-                'analysis': {
-                    'running': False,
-                    'tokens': [],
-                    'results': pd.DataFrame(),
-                    'current_index': 0,
-                    'start_time': None,
-                    'total_tokens': 0
+                "analysis": {
+                    "running": False,
+                    "tokens": [],
+                    "results": pd.DataFrame(),
+                    "current_index": 0,
+                    "start_time": None,
+                    "total_tokens": 0,
+                    "current_token": None
                 },
-                'config': {
-                    'batch_size': DEFAULT_BATCH_SIZE,
-                    'strict_mode': True,
-                    'columns': ['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer']
+                "config": {
+                    "batch_size": DEFAULT_BATCH_SIZE,
+                    "strict_mode": True,
+                    "live_sort": True,
+                    "columns": ["score", "symbol", "price", "liquidity_score", "confidence", "explorer"]
                 }
             })
 
-    # 侧边栏界面
+def setup_ui():
+    st.set_page_config(layout="wide", page_title="Solana代币分析仪")
+    
+    st.markdown("""
+    <style>
+        section[data-testid="stSidebar"] {
+            width: 100vw !important;
+            min-width: 100vw !important;
+            transform: translateX(0) !important;
+            z-index: 999999;
+        }
+        [data-testid="collapsedControl"] {
+            display: none !important;
+        }
+        .main .block-container {
+            padding-top: 0;
+            position: relative;
+            z-index: 1;
+        }
+        .metric-box {
+            padding: 10px;
+            background: #1a1a1a;
+            border-radius: 5px;
+            margin: 5px 0;
+        }
+        @media (max-width: 768px) {
+            div.stButton > button {
+                width: 100% !important;
+                margin: 8px 0 !important;
+            }
+            div[data-testid="column"] {
+                flex: 0 0 100% !important;
+                width: 100% !important;
+            }
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+def render_sidebar(analyzer):
     with st.sidebar:
-        st.title("🔍 带检查点的分析仪")
+        st.title("🔍 Solana代币分析仪")
         st.image("https://jup.ag/svg/jupiter-logo.svg", width=200)
-        
-        # 控制面板
+
         with st.expander("⚙️ 控制面板", expanded=True):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                start_btn = st.button("🚀 开始")
-            with col2:
-                stop_btn = st.button("⏹ 停止")
-            with col3:
-                clear_btn = st.button("🧹 清除")
+            cols = st.columns(3)
+            with cols[0]:
+                start_btn = st.button("🚀 开始分析")
+            with cols[1]:
+                stop_btn = st.button("⏹ 停止分析")
+            with cols[2]:
+                clear_btn = st.button("🧹 清除结果")
 
-            st.session_state.config['batch_size'] = st.number_input(
-                "批量大小", 1, 20, DEFAULT_BATCH_SIZE
+            st.session_state.config["batch_size"] = st.number_input(
+                "批量处理数量", 1, 20, DEFAULT_BATCH_SIZE,
+                help="每次处理的代币数量"
             )
-            st.session_state.config['strict_mode'] = st.checkbox(
-                "严格模式", True
+            st.session_state.config["strict_mode"] = st.checkbox(
+                "严格验证模式", True,
+                help="过滤社区标签和非主网代币"
             )
 
-        # 显示进度
-        if st.session_state.analysis['running']:
-            show_progress()
+        with st.expander("🧪 高级设置", expanded=True):
+            st.subheader("显示选项")
+            st.session_state.config["live_sort"] = st.checkbox(
+                "实时排序结果", True,
+                help="根据评分自动排序"
+            )
+            st.session_state.config["columns"] = st.multiselect(
+                "显示列",
+                ["score", "symbol", "price", "buy_price", "sell_price",
+                 "liquidity_score", "confidence", "explorer", "price_impact_10k", "price_impact_100k"],
+                default=st.session_state.config["columns"]
+            )
 
-        # 显示结果
-        if not st.session_state.analysis['results'].empty:
+        if st.session_state.analysis["running"]:
+            render_progress()
+
+        if st.session_state.analysis.get("current_token"):
+            render_current_token()
+
+        if not st.session_state.analysis["results"].empty:
             st.divider()
-            show_results()
+            render_results()
 
-    # 处理按钮事件
-    if start_btn and not st.session_state.analysis['running']:
-        start_analysis(analyzer)
-        
-    if stop_btn and st.session_state.analysis['running']:
-        stop_analysis()
-        
-    if clear_btn:
-        clear_analysis()
+    handle_actions(start_btn, stop_btn, clear_btn, analyzer)
 
-    # 处理批次
-    if st.session_state.analysis['running']:
-        process_batch(analyzer)
-
-def start_analysis(analyzer):
-    tokens = analyzer.get_token_list(st.session_state.config['strict_mode'])
-    if not tokens:
-        st.error("未获取到有效代币")
-        return
-    
-    st.session_state.analysis.update({
-        'running': True,
-        'tokens': tokens,
-        'results': pd.DataFrame(),
-        'current_index': 0,
-        'start_time': time.time(),
-        'total_tokens': len(tokens)
-    })
-    save_checkpoint()
-
-def process_batch(analyzer):
+def render_progress():
     analysis = st.session_state.analysis
-    batch_size = st.session_state.config['batch_size']
+    progress = analysis["current_index"] / analysis["total_tokens"]
     
-    start_idx = analysis['current_index']
-    end_idx = min(start_idx + batch_size, analysis['total_tokens'])
-    batch_tokens = analysis['tokens'][start_idx:end_idx]
-    
-    # 分析当前批次
-    batch_results = analyzer.analyze_batch(batch_tokens)
-    
-    # 更新状态
-    if not batch_results.empty:
-        analysis['results'] = pd.concat([analysis['results'], batch_results], ignore_index=True)
-    analysis['current_index'] = end_idx
-    
-    # 保存检查点
-    save_checkpoint()
-    
-    # 检查是否完成
-    if analysis['current_index'] >= analysis['total_tokens']:
-        analysis['running'] = False
-        CheckpointManager.clear_checkpoints()
-        st.rerun()
-    else:
-        time.sleep(0.1)
-        st.rerun()
-
-def save_checkpoint():
-    progress = {
-        'current_index': st.session_state.analysis['current_index'],
-        'start_time': st.session_state.analysis['start_time'],
-        'total_tokens': st.session_state.analysis['total_tokens']
-    }
-    CheckpointManager.save_checkpoint(
-        pd.Series(st.session_state.analysis['tokens']),
-        st.session_state.analysis['results'],
-        progress,
-        st.session_state.config
-    )
-
-def show_progress():
-    analysis = st.session_state.analysis
-    progress = analysis['current_index'] / analysis['total_tokens']
-    
-    st.progress(progress)
+    st.progress(progress, text="分析进度")
     
     cols = st.columns(3)
     with cols[0]:
         st.metric("已处理", f"{analysis['current_index']}/{analysis['total_tokens']}")
     with cols[1]:
-        elapsed = time.time() - analysis['start_time']
-        speed = analysis['current_index'] / elapsed if elapsed > 0 else 0
-        st.metric("速度", f"{speed:.1f} tkn/s")
+        elapsed = time.time() - analysis["start_time"]
+        speed = analysis["current_index"] / elapsed if elapsed > 0 else 0
+        st.metric("处理速度", f"{speed:.1f} tkn/s")
     with cols[2]:
-        st.metric("发现数", len(analysis['results']))
+        st.metric("发现数量", len(analysis["results"]))
 
-def show_results():
-    df = st.session_state.analysis['results']
-    columns = st.session_state.config['columns']
+def render_current_token():
+    with st.expander("🔍 当前代币", expanded=True):
+        token = st.session_state.analysis["current_token"]
+        st.write(f"**代币符号**: {token.get('symbol', '未知')}")
+        st.write(f"**合约地址**: `{token['address'][:12]}...`")
+        st.write(f"**链ID**: {token.get('chainId', '未知')}")
+        st.write(f"**标签**: {', '.join(token.get('tags', []))}")
+
+def render_results():
+    df = st.session_state.analysis["results"]
+    config = st.session_state.config
+    
+    if config["live_sort"]:
+        df = df.sort_values("score", ascending=False)
     
     column_config = {
-        'score': st.column_config.NumberColumn('评分', format="%.1f"),
-        'symbol': st.column_config.TextColumn('代币'),
-        'price': st.column_config.NumberColumn('价格', format="$%.4f"),
-        'liquidity': st.column_config.ProgressColumn('流动性', format="%.1f", min_value=0, max_value=100),
-        'confidence': st.column_config.SelectboxColumn('信心', options=['low', 'medium', 'high']),
-        'explorer': st.column_config.LinkColumn('浏览器')
+        "score": st.column_config.NumberColumn("评分", format="%.1f"),
+        "symbol": st.column_config.TextColumn("代币"),
+        "price": st.column_config.NumberColumn("价格", format="$%.4f"),
+        "buy_price": st.column_config.NumberColumn("买价", format="$%.4f"),
+        "sell_price": st.column_config.NumberColumn("卖价", format="$%.4f"),
+        "liquidity_score": st.column_config.ProgressColumn("流动性", format="%.1f", min_value=0, max_value=100),
+        "confidence": st.column_config.SelectboxColumn("信心等级", options=["low", "medium", "high"]),
+        "explorer": st.column_config.LinkColumn("区块链浏览器"),
+        "price_impact_10k": st.column_config.NumberColumn("10K冲击", format="%.2f%%"),
+        "price_impact_100k": st.column_config.NumberColumn("100K冲击", format="%.2f%%")
     }
-    
+
     st.dataframe(
-        df[columns],
+        df[config["columns"]],
         column_config=column_config,
         height=min(HEADER_HEIGHT + len(df) * ROW_HEIGHT, 600),
         use_container_width=True,
         hide_index=True
     )
 
+def handle_actions(start_btn, stop_btn, clear_btn, analyzer):
+    if start_btn and not st.session_state.analysis["running"]:
+        start_analysis(analyzer)
+        
+    if stop_btn and st.session_state.analysis["running"]:
+        stop_analysis()
+        
+    if clear_btn:
+        clear_analysis()
+
+def start_analysis(analyzer):
+    tokens = analyzer.fetch_token_list(st.session_state.config["strict_mode"])
+    if not tokens:
+        st.error("未找到有效代币")
+        return
+
+    st.session_state.analysis.update({
+        "running": True,
+        "tokens": tokens,
+        "results": pd.DataFrame(),
+        "current_index": 0,
+        "start_time": time.time(),
+        "total_tokens": len(tokens),
+        "current_token": None
+    })
+    process_batch(analyzer)
+
+def process_batch(analyzer):
+    analysis = st.session_state.analysis
+    if not analysis["running"]:
+        return
+
+    batch_size = st.session_state.config["batch_size"]
+    start_idx = analysis["current_index"]
+    end_idx = min(start_idx + batch_size, analysis["total_tokens"])
+
+    for idx in range(start_idx, end_idx):
+        analysis["current_token"] = analysis["tokens"][idx]
+        result = analyzer.analyze_token(analysis["current_token"])
+        
+        if result:
+            new_df = pd.DataFrame([result])
+            analysis["results"] = pd.concat([analysis["results"], new_df], ignore_index=True)
+        
+        analysis["current_index"] += 1
+        time.sleep(0.1)
+        
+        AnalysisState.save_state(dict(st.session_state))
+
+    if analysis["current_index"] >= analysis["total_tokens"]:
+        analysis["running"] = False
+        AnalysisState.clear_state()
+    else:
+        st.rerun()
+
 def stop_analysis():
-    if st.session_state.analysis['running']:
-        st.session_state.analysis['running'] = False
-        save_checkpoint()
+    if st.session_state.analysis["running"]:
+        st.session_state.analysis["running"] = False
+        AnalysisState.save_state(dict(st.session_state))
         st.rerun()
 
 def clear_analysis():
     st.session_state.analysis.update({
-        'running': False,
-        'tokens': [],
-        'results': pd.DataFrame(),
-        'current_index': 0,
-        'start_time': None,
-        'total_tokens': 0
+        "running": False,
+        "tokens": [],
+        "results": pd.DataFrame(),
+        "current_index": 0,
+        "start_time": None,
+        "total_tokens": 0,
+        "current_token": None
     })
-    CheckpointManager.clear_checkpoints()
+    AnalysisState.clear_state()
     st.rerun()
 
 if __name__ == "__main__":
-    main()
+    initialize_session()
+    setup_ui()
+    analyzer = TokenAnalyzer()
+    render_sidebar(analyzer)
+    if st.session_state.analysis["running"]:
+        process_batch(analyzer)
