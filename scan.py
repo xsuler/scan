@@ -16,9 +16,9 @@ JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 CHECKPOINT_FILE = "checkpoint.pkl"
-DEFAULT_BATCH_SIZE = 5
 ROW_HEIGHT = 35
 HEADER_HEIGHT = 50
+DEFAULT_BATCH_SIZE = 1
 
 # 初始化检查点目录
 CHECKPOINT_DIR = Path("./checkpoints")
@@ -66,7 +66,7 @@ class TokenAnalyzer:
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("https://", adapter)
 
-    def validate_token(self, token, strict_mode):
+    def validate_token(self, token, excluded_tags):
         validation_result = {
             "valid": False,
             "reasons": [],
@@ -85,13 +85,15 @@ class TokenAnalyzer:
                     validation_result["reasons"].append(f"Missing {field}")
                     return False
 
-            if strict_mode:
-                if "community" in token.get("tags", []):
-                    validation_result["reasons"].append("Community tag")
-                    return False
-                if token.get("chainId") != 101:
-                    validation_result["reasons"].append("Non-mainnet token")
-                    return False
+            token_tags = set(token.get("tags", []))
+            excluded = set(excluded_tags)
+            if token_tags & excluded:
+                validation_result["reasons"].append(f"Excluded tags: {', '.join(token_tags & excluded)}")
+                return False
+
+            if token.get("chainId") != 101:
+                validation_result["reasons"].append("Non-mainnet token")
+                return False
 
             validation_result["valid"] = True
             return True
@@ -101,12 +103,12 @@ class TokenAnalyzer:
         finally:
             self.debug_log.append(validation_result)
 
-    def fetch_token_list(self, strict_mode):
+    def fetch_token_list(self, excluded_tags):
         try:
             response = self.session.get(JUPITER_TOKEN_LIST, timeout=15)
             response.raise_for_status()
             tokens = response.json()
-            return [t for t in tokens if self.validate_token(t, strict_mode)]
+            return [t for t in tokens if self.validate_token(t, excluded_tags)]
         except Exception as e:
             st.error(f"代币获取失败: {str(e)}")
             return []
@@ -222,8 +224,8 @@ def initialize_session():
                     "current_token": None
                 },
                 "config": {
+                    "excluded_tags": ["community"],
                     "batch_size": DEFAULT_BATCH_SIZE,
-                    "strict_mode": True,
                     "live_sort": True,
                     "columns": ["score", "symbol", "price", "liquidity_score", "confidence", "explorer"]
                 }
@@ -281,17 +283,13 @@ def render_sidebar(analyzer):
             with cols[2]:
                 clear_btn = st.button("🧹 清除结果")
 
-            st.session_state.config["batch_size"] = st.number_input(
-                "批量处理数量", 1, 20, DEFAULT_BATCH_SIZE,
-                help="每次处理的代币数量"
-            )
-            st.session_state.config["strict_mode"] = st.checkbox(
-                "严格验证模式", True,
-                help="过滤社区标签和非主网代币"
+            st.session_state.config["excluded_tags"] = st.multiselect(
+                "排除标签",
+                options=["community", "old-registry", "unknown"],
+                default=st.session_state.config["excluded_tags"]
             )
 
-        with st.expander("🧪 高级设置", expanded=True):
-            st.subheader("显示选项")
+        with st.expander("📊 显示选项", expanded=True):
             st.session_state.config["live_sort"] = st.checkbox(
                 "实时排序结果", True,
                 help="根据评分自动排序"
@@ -378,7 +376,7 @@ def handle_actions(start_btn, stop_btn, clear_btn, analyzer):
         clear_analysis()
 
 def start_analysis(analyzer):
-    tokens = analyzer.fetch_token_list(st.session_state.config["strict_mode"])
+    tokens = analyzer.fetch_token_list(st.session_state.config["excluded_tags"])
     if not tokens:
         st.error("未找到有效代币")
         return
