@@ -7,6 +7,7 @@ import numpy as np
 from solders.pubkey import Pubkey
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import threading
 
 # Configuration
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
@@ -158,7 +159,7 @@ class TokenAnalyzer:
             )
             
             final_score = (raw_score - penalties) * 100
-            return final_score  # 移除分数限制
+            return final_score
             
         except KeyError as e:
             print(f"Missing key in score calculation: {str(e)}")
@@ -191,6 +192,7 @@ class AnalysisManager:
     def __init__(self, analyzer):
         self.analyzer = analyzer
         self.init_session()
+        self.lock = threading.Lock()
         
     def init_session(self):
         defaults = {
@@ -201,6 +203,7 @@ class AnalysisManager:
                 'metrics': {'start_time': None, 'speed': 0},
                 'current_index': 0,
                 'current_token': None,
+                'tokens': []
             },
             'live_results': pd.DataFrame()
         }
@@ -208,55 +211,65 @@ class AnalysisManager:
             st.session_state.setdefault(key, val)
 
     def start_analysis(self, tokens, params):
-        st.session_state.analysis = {
-            'running': True,
-            'progress': 0,
-            'params': params,
-            'metrics': {
-                'start_time': time.time(),
-                'speed': 0,
-                'total_tokens': len(tokens)
-            },
-            'current_index': 0,
-            'tokens': tokens,
-            'current_token': None
-        }
-        st.session_state.live_results = pd.DataFrame()
+        with self.lock:
+            st.session_state.analysis = {
+                'running': True,
+                'progress': 0,
+                'params': params,
+                'metrics': {
+                    'start_time': time.time(),
+                    'speed': 0,
+                    'total_tokens': len(tokens)
+                },
+                'current_index': 0,
+                'tokens': tokens,
+                'current_token': None
+            }
+            st.session_state.live_results = pd.DataFrame()
+        
+        # Start background thread
+        threading.Thread(target=self.process_tokens, daemon=True).start()
 
     def process_tokens(self):
-        if not st.session_state.analysis['running']:
-            return
+        while True:
+            with self.lock:
+                if not st.session_state.analysis['running']:
+                    break
 
-        idx = st.session_state.analysis['current_index']
-        tokens = st.session_state.analysis['tokens']
-        
-        if idx < len(tokens):
-            token = tokens[idx]
-            analysis = self.analyzer.analyze_token(token)
-            
-            if analysis is not None:
-                st.session_state.analysis['current_token'] = token
-                new_row = pd.DataFrame([analysis])
-                st.session_state.live_results = pd.concat(
-                    [st.session_state.live_results, new_row],
-                    ignore_index=True
+                idx = st.session_state.analysis['current_index']
+                tokens = st.session_state.analysis['tokens']
+                
+                if idx >= len(tokens):
+                    self.finalize_analysis()
+                    break
+
+                token = tokens[idx]
+                analysis = self.analyzer.analyze_token(token)
+                
+                if analysis is not None:
+                    st.session_state.analysis['current_token'] = token
+                    new_row = pd.DataFrame([analysis])
+                    st.session_state.live_results = pd.concat(
+                        [st.session_state.live_results, new_row],
+                        ignore_index=True
+                    )
+
+                st.session_state.analysis['progress'] = idx + 1
+                st.session_state.analysis['current_index'] += 1
+                st.session_state.analysis['metrics']['speed'] = (idx + 1) / (
+                    time.time() - st.session_state.analysis['metrics']['start_time']
                 )
 
-            st.session_state.analysis['progress'] = idx + 1
-            st.session_state.analysis['current_index'] += 1
-            st.session_state.analysis['metrics']['speed'] = (idx + 1) / (
-                time.time() - st.session_state.analysis['metrics']['start_time']
-            )
-            
-            time.sleep(UI_REFRESH_INTERVAL)
-            st.rerun()
-        else:
-            self.finalize_analysis()
+                time.sleep(UI_REFRESH_INTERVAL)
+                
+            # Update UI through rerun
+            st.experimental_rerun()
 
     def finalize_analysis(self):
-        st.session_state.analysis['running'] = False
-        if st.session_state.live_results.empty:
-            st.warning("No qualified tokens found during analysis")
+        with self.lock:
+            st.session_state.analysis['running'] = False
+            if st.session_state.live_results.empty:
+                st.warning("No qualified tokens found during analysis")
 
 class UIManager:
     def __init__(self, analyzer):
@@ -265,10 +278,8 @@ class UIManager:
         self.inject_responsive_css()
 
     def inject_responsive_css(self):
-        """响应式布局适配"""
         st.markdown("""
         <style>
-            /* 强制侧边栏全屏显示 */
             section[data-testid="stSidebar"] {
                 width: 100% !important;
                 min-width: 100% !important;
@@ -276,39 +287,32 @@ class UIManager:
                 z-index: 999999;
             }
 
-            /* 隐藏折叠按钮 */
             [data-testid="collapsedControl"] {
                 display: none !important;
             }
 
-            /* 主内容区适配 */
             .main .block-container {
                 padding-top: 2rem;
                 position: relative;
                 z-index: 1;
             }
 
-            /* 移动端按钮适配 */
             @media (max-width: 768px) {
-                /* 按钮容器 */
                 div.stButton > button {
                     width: 100% !important;
                     margin: 8px 0 !important;
                 }
                 
-                /* 两列布局改为堆叠 */
                 div[data-testid="column"] {
                     flex: 0 0 100% !important;
                     width: 100% !important;
                 }
                 
-                /* 表格优化 */
                 div[data-testid="stDataFrame"] {
                     font-size: 14px;
                 }
             }
 
-            /* 桌面端按钮间距 */
             @media (min-width: 769px) {
                 div[data-testid="stHorizontalBlock"] {
                     gap: 1rem;
@@ -328,19 +332,18 @@ class UIManager:
                     'live_sorting': st.checkbox("Real-time Sorting", True)
                 }
 
-            # 按钮容器使用弹性布局
             with st.container():
-                cols = st.columns([1, 1, 1])  # 三列布局
+                cols = st.columns([1, 1, 1])
                 with cols[0]:
-                    if st.button("🚀 Start", use_container_width=True, help="开始分析"):
+                    if st.button("🚀 Start", use_container_width=True):
                         self.start_analysis(params)
                 with cols[1]:
-                    if st.button("⏹ Stop", use_container_width=True, help="停止分析"):
-                        st.session_state.analysis['running'] = False
+                    if st.button("⏹ Stop", use_container_width=True):
+                        self.manager.finalize_analysis()
                 with cols[2]:
-                    if st.button("🧹 Clear", use_container_width=True, help="清除结果"):
+                    if st.button("🧹 Clear", use_container_width=True):
                         st.session_state.live_results = pd.DataFrame()
-                        st.rerun()
+                        st.experimental_rerun()
 
             if st.session_state.analysis.get('running', False):
                 self.render_progress()
@@ -379,7 +382,6 @@ class UIManager:
         tokens = self.analyzer.get_all_tokens(params['strict_mode'])
         if tokens:
             self.manager.start_analysis(tokens, params)
-            self.manager.process_tokens()
         else:
             st.error("No tokens found matching criteria")
 
@@ -392,10 +394,7 @@ class UIManager:
         st.subheader("📊 Live Results")
         df = st.session_state.live_results
         
-        # 动态排序和列顺序调整
         sorted_df = df.sort_values(by='score', ascending=False)
-        
-        # 调整列顺序（score第一列）
         sorted_df = sorted_df[['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer']]
 
         table_height = self.calculate_table_height(sorted_df)
@@ -403,50 +402,19 @@ class UIManager:
         st.data_editor(
             sorted_df,
             column_config={
-                'score': st.column_config.NumberColumn(
-                    'Score',
-                    help="综合评分",
-                    format="%.1f",
-                    width='small'
-                ),
-                'symbol': st.column_config.TextColumn(
-                    'Token',
-                    width='small',
-                    help="代币符号"
-                ),
-                'price': st.column_config.NumberColumn(
-                    'Price',
-                    format="$%.4f",
-                    width='small',
-                    help="当前市场价格"
-                ),
-                'liquidity': st.column_config.ProgressColumn(
-                    'Liquidity',
-                    help="流动性评分 (0-100)",
-                    format="%.1f",
-                    min_value=0,
-                    max_value=100
-                ),
-                'confidence': st.column_config.SelectboxColumn(
-                    'Confidence',
-                    help="价格信心等级",
-                    options=['low', 'medium', 'high'],
-                    width='small'
-                ),
-                'explorer': st.column_config.LinkColumn(
-                    'Explorer',
-                    help="区块链浏览器链接",
-                    width='medium'
-                )
+                'score': st.column_config.NumberColumn('Score', format="%.1f"),
+                'symbol': st.column_config.TextColumn('Token'),
+                'price': st.column_config.NumberColumn('Price', format="$%.4f"),
+                'liquidity': st.column_config.ProgressColumn('Liquidity', format="%.1f"),
+                'confidence': st.column_config.SelectboxColumn('Confidence'),
+                'explorer': st.column_config.LinkColumn('Explorer')
             },
-            column_order=['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer'],
             height=table_height,
             use_container_width=True,
             hide_index=True,
             key="live_results_table"
         )
         
-        # 实时统计指标
         cols = st.columns(3)
         with cols[0]:
             st.metric("Avg Score", f"{df['score'].mean():.1f}")
@@ -456,8 +424,7 @@ class UIManager:
             st.metric("High Conf", df[df['confidence'] == 'high'].shape[0])
 
     def render_main(self):
-        if st.session_state.analysis.get('running', False):
-            self.manager.process_tokens()
+        pass  # Background thread handles processing
 
 if __name__ == "__main__":
     analyzer = TokenAnalyzer()
