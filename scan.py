@@ -3,40 +3,73 @@ import pandas as pd
 import requests
 import time
 import numpy as np
+import os
+import pickle
 from solders.pubkey import Pubkey
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Configuration
+# 配置参数
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
 JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
 JUPITER_PRICE_API = "https://api.jup.ag/price/v2"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+STATE_FILE = "analysis_state.pkl"
 DEFAULT_BATCH_SIZE = 5
 ROW_HEIGHT = 35
 HEADER_HEIGHT = 50
 
-# 初始化Session State
-if 'analysis' not in st.session_state:
-    st.session_state.update({
-        'analysis': {
-            'running': False,
-            'tokens': [],
-            'results': pd.DataFrame(),
-            'current_index': 0,
-            'start_time': None,
-            'total_tokens': 0
-        },
-        'config': {
-            'batch_size': DEFAULT_BATCH_SIZE,
-            'strict_mode': True,
-            'score_weights': {'liquidity': 0.4, 'stability': 0.4, 'depth': 0.2},
-            'price_impact_levels': ['10', '100'],
-            'columns': ['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer']
-        }
-    })
+def load_state():
+    """从文件加载保存的状态"""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"加载状态失败: {str(e)}")
+    return None
 
-class EnhancedAnalyzer:
+def save_state(state):
+    """保存当前状态到文件"""
+    try:
+        with open(STATE_FILE, 'wb') as f:
+            pickle.dump(state, f)
+    except Exception as e:
+        print(f"保存状态失败: {str(e)}")
+
+def clear_state():
+    """清除保存的状态"""
+    if os.path.exists(STATE_FILE):
+        try:
+            os.remove(STATE_FILE)
+        except Exception as e:
+            print(f"清除状态失败: {str(e)}")
+
+# 初始化或恢复状态
+if 'analysis' not in st.session_state:
+    saved_state = load_state()
+    if saved_state:
+        st.session_state.update(saved_state)
+    else:
+        st.session_state.update({
+            'analysis': {
+                'running': False,
+                'tokens': [],
+                'results': pd.DataFrame(),
+                'current_index': 0,
+                'start_time': None,
+                'total_tokens': 0
+            },
+            'config': {
+                'batch_size': DEFAULT_BATCH_SIZE,
+                'strict_mode': True,
+                'score_weights': {'liquidity': 0.4, 'stability': 0.4, 'depth': 0.2},
+                'price_impact_levels': ['10', '100'],
+                'columns': ['score', 'symbol', 'price', 'liquidity', 'confidence', 'explorer']
+            }
+        })
+
+class StatefulAnalyzer:
     def __init__(self):
         self.session = requests.Session()
         retries = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])
@@ -167,8 +200,8 @@ class EnhancedAnalyzer:
         return metrics
 
 def main():
-    st.set_page_config(layout="wide", page_title="Advanced Token Analyzer")
-    analyzer = EnhancedAnalyzer()
+    st.set_page_config(layout="wide", page_title="状态持久化代币分析仪")
+    analyzer = StatefulAnalyzer()
     
     st.markdown("""
     <style>
@@ -196,70 +229,62 @@ def main():
                 width: 100% !important;
             }
         }
-        .advanced-settings {
-            padding: 15px;
-            background: #0e1117;
-            border-radius: 10px;
-            margin-top: 20px;
-        }
     </style>
     """, unsafe_allow_html=True)
 
     with st.sidebar:
-        st.title("🔍 Solana代币分析仪")
+        st.title("🔍 状态持久化分析仪")
         st.image("https://jup.ag/svg/jupiter-logo.svg", width=200)
         
         with st.container():
             col1, col2, col3 = st.columns(3)
             with col1:
-                if st.button("🚀 开始分析"):
-                    start_analysis(analyzer)
+                start_btn = st.button("🚀 开始分析")
             with col2:
-                if st.button("⏹ 停止"):
-                    stop_analysis()
+                stop_btn = st.button("⏹ 停止")
             with col3:
-                if st.button("🧹 清除结果"):
-                    clear_results()
+                clear_btn = st.button("🧹 清除")
 
-        with st.expander("⚙️ 基本设置", expanded=True):
+        with st.expander("⚙️ 配置面板", expanded=True):
             st.session_state.config['batch_size'] = st.number_input(
-                "批量处理数量", 1, 20, DEFAULT_BATCH_SIZE
+                "批量处理数量", 1, 20, DEFAULT_BATCH_SIZE,
+                help="每次处理代币数量"
             )
             st.session_state.config['strict_mode'] = st.checkbox(
-                "严格验证模式", True
+                "严格验证模式", True,
+                help="过滤社区代币和非主网代币"
             )
 
         with st.expander("🧪 高级设置", expanded=True):
-            with st.container():
-                st.subheader("评分权重")
-                cols = st.columns(3)
-                with cols[0]:
-                    st.session_state.config['score_weights']['liquidity'] = st.slider(
-                        "流动性权重", 0.0, 1.0, 0.4, 0.05
-                    )
-                with cols[1]:
-                    st.session_state.config['score_weights']['stability'] = st.slider(
-                        "稳定性权重", 0.0, 1.0, 0.4, 0.05
-                    )
-                with cols[2]:
-                    st.session_state.config['score_weights']['depth'] = st.slider(
-                        "市场深度权重", 0.0, 1.0, 0.2, 0.05
-                    )
-                
-                st.subheader("价格冲击等级")
-                st.session_state.config['price_impact_levels'] = st.multiselect(
-                    "选择冲击等级",
-                    ['10', '100', '500', '1000'],
-                    default=['10', '100']
+            st.subheader("评分权重")
+            cols = st.columns(3)
+            with cols[0]:
+                st.session_state.config['score_weights']['liquidity'] = st.slider(
+                    "流动性", 0.0, 1.0, 0.4, 0.05
                 )
-                
-                st.subheader("显示列设置")
-                st.session_state.config['columns'] = st.multiselect(
-                    "选择显示列",
-                    ['score', 'symbol', 'price', 'buy_price', 'sell_price', 
-                     'liquidity', 'confidence', 'explorer', 'price_impact'],
-                    default=st.session_state.config['columns']
+            with cols[1]:
+                st.session_state.config['score_weights']['stability'] = st.slider(
+                    "稳定性", 0.0, 1.0, 0.4, 0.05
                 )
+            with cols[2]:
+                st.session_state.config['score_weights']['depth'] = st.slider(
+                    "市场深度", 0.0, 1.0, 0.2, 0.05
+                )
+            
+            st.subheader("价格冲击等级")
+            st.session_state.config['price_impact_levels'] = st.multiselect(
+                "选择等级",
+                ['10', '100', '500', '1000'],
+                default=['10', '100']
+            )
+            
+            st.subheader("显示选项")
+            st.session_state.config['columns'] = st.multiselect(
+                "显示列",
+                ['score', 'symbol', 'price', 'buy_price', 'sell_price', 
+                 'liquidity', 'confidence', 'explorer', 'price_impact'],
+                default=st.session_state.config['columns']
+            )
 
         if st.session_state.analysis['running']:
             show_progress()
@@ -268,24 +293,36 @@ def main():
             st.divider()
             show_results()
 
+    # 处理按钮事件
+    if start_btn:
+        start_analysis(analyzer)
+    if stop_btn:
+        stop_analysis()
+    if clear_btn:
+        clear_analysis()
+
+    # 自动继续处理
     if st.session_state.analysis['running']:
         process_batch(analyzer)
+        save_state(dict(st.session_state))  # 实时保存状态
 
 def start_analysis(analyzer):
-    tokens = analyzer.get_token_list()
-    if not tokens:
-        st.error("未找到有效代币")
-        return
+    if not st.session_state.analysis['running']:
+        tokens = analyzer.get_token_list()
+        if not tokens:
+            st.error("未找到有效代币")
+            return
 
-    st.session_state.analysis.update({
-        'running': True,
-        'tokens': tokens,
-        'results': pd.DataFrame(),
-        'current_index': 0,
-        'start_time': time.time(),
-        'total_tokens': len(tokens)
-    })
-    st.rerun()
+        st.session_state.analysis.update({
+            'running': True,
+            'tokens': tokens,
+            'results': pd.DataFrame(),
+            'current_index': 0,
+            'start_time': time.time(),
+            'total_tokens': len(tokens)
+        })
+        save_state(dict(st.session_state))
+        st.rerun()
 
 def process_batch(analyzer):
     analysis = st.session_state.analysis
@@ -303,8 +340,9 @@ def process_batch(analyzer):
 
     if analysis['current_index'] >= analysis['total_tokens']:
         analysis['running'] = False
+        clear_state()
         if analysis['results'].empty:
-            st.warning("未找到符合条件的代币")
+            st.warning("未找到合格代币")
     else:
         time.sleep(0.1)
         st.rerun()
@@ -321,31 +359,28 @@ def show_progress():
     with cols[1]:
         elapsed = time.time() - analysis['start_time']
         speed = analysis['current_index'] / elapsed if elapsed > 0 else 0
-        st.metric("处理速度", f"{speed:.1f} 代币/秒")
+        st.metric("速度", f"{speed:.1f} tkn/s")
     with cols[2]:
-        st.metric("发现数量", len(analysis['results']))
+        st.metric("发现数", len(analysis['results']))
 
 def show_results():
     df = st.session_state.analysis['results']
     config = st.session_state.config
     
-    # 移除排序逻辑，直接使用原始数据
-    display_df = df[config['columns']]
-    
     column_config = {
         'score': st.column_config.NumberColumn('评分', format="%.1f"),
         'symbol': st.column_config.TextColumn('代币'),
         'price': st.column_config.NumberColumn('价格', format="$%.4f"),
-        'buy_price': st.column_config.NumberColumn('买入价', format="$%.4f"),
-        'sell_price': st.column_config.NumberColumn('卖出价', format="$%.4f"),
+        'buy_price': st.column_config.NumberColumn('买价', format="$%.4f"),
+        'sell_price': st.column_config.NumberColumn('卖价', format="$%.4f"),
         'liquidity': st.column_config.ProgressColumn('流动性', format="%.1f", min_value=0, max_value=100),
-        'confidence': st.column_config.SelectboxColumn('信心等级', options=['low', 'medium', 'high']),
-        'explorer': st.column_config.LinkColumn('区块链浏览器'),
+        'confidence': st.column_config.SelectboxColumn('信心', options=['low', 'medium', 'high']),
+        'explorer': st.column_config.LinkColumn('浏览器'),
         'price_impact': st.column_config.BarChartColumn('价格冲击', y_min=0, y_max=100)
     }
 
     st.dataframe(
-        display_df,
+        df[config['columns']],
         column_config=column_config,
         height=min(HEADER_HEIGHT + len(df) * ROW_HEIGHT, 600),
         use_container_width=True,
@@ -353,10 +388,12 @@ def show_results():
     )
 
 def stop_analysis():
-    st.session_state.analysis['running'] = False
-    st.rerun()
+    if st.session_state.analysis['running']:
+        st.session_state.analysis['running'] = False
+        clear_state()
+        st.rerun()
 
-def clear_results():
+def clear_analysis():
     st.session_state.analysis.update({
         'running': False,
         'tokens': [],
@@ -365,6 +402,7 @@ def clear_results():
         'start_time': None,
         'total_tokens': 0
     })
+    clear_state()
     st.rerun()
 
 if __name__ == "__main__":
